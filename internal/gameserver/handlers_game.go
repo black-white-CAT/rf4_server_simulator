@@ -825,6 +825,16 @@ func hCastPrepare(ctx *Ctx) ([]byte, bool) {
 		}
 		return nil, false
 	}
+	// 轮子耐久归零即损坏，但它不像断竿那样从手上消失，客户端仍会发 14/1。
+	// 这里必须拦住，否则损坏的轮子还能继续抛投上鱼。
+	// 不清 GearGuid：竿确实还在手上，留着它 14/2 才能回出"请先修理"的提示。
+	if reelGUID := srv.rigBrokenReelGUID(ctx.Sess.pushCtx(), ctx.Sess.Userid, gear); reelGUID != "" {
+		ctx.Log.Info("14/1 被拒：渔线轮已损坏", "rod", shortGUID(gear), "reel", shortGUID(reelGUID))
+		if body := castReady158(ctx, "", depthCM, 0); body != nil {
+			return body, true
+		}
+		return nil, false
+	}
 
 	// 海杆的 Rod 实例由 4/22 竿线全量树构建；普通纺车杆通常已从库存树
 	// 实例化。海杆没有该对象时，客户端的 RUILoadIndicator 会一直显示 0。
@@ -902,6 +912,12 @@ func hCast(ctx *Ctx) ([]byte, bool) {
 		st.mu.Unlock()
 		ctx.Log.Info("14/2 被拒：装备限制", "rod", shortGUID(gear), "reason", reason)
 		ctx.ReplyOperationResult(136) // kOperationResult_WrongRegion
+		return nil, true
+	}
+	// 14/1 给的是力度上限，客户端被拒后仍可能直发 14/2，这里再拦一道。
+	if reelGUID := srv.rigBrokenReelGUID(ctx.Sess.pushCtx(), ctx.Sess.Userid, gear); reelGUID != "" {
+		ctx.Log.Info("14/2 被拒：渔线轮已损坏", "rod", shortGUID(gear), "reel", shortGUID(reelGUID))
+		ctx.ReplyFailure("System.InvalidOperationException", "渔线轮已损坏，请先修理")
 		return nil, true
 	}
 	// 14/1 给出的是满力度上限；14/2 才携带本次实际落点、动作和出手力度。
@@ -1198,6 +1214,11 @@ func hFishingHooked(ctx *Ctx) ([]byte, bool) {
 	castActive := st.CastActive
 	resolved := st.Resolved
 	st.mu.Unlock()
+	fishGUID, species := "", ""
+	if pending != nil {
+		fishGUID, species = pending.FishGUID, pending.Species
+	}
+	ctx.Log.Info("14/11 中鱼", "fish", shortGUID(fishGUID), "species", species, "was_hooked", wasHooked)
 	if pending != nil {
 		if err := srv.consumeHookedBait(ctx.Sess, pending, gear); err != nil {
 			ctx.Log.Warn("中鱼后鱼饵扣减失败", "fish", pending.FishGUID, "err", err)
@@ -1414,7 +1435,13 @@ func registerSessionHandlers(d *Dispatch) {
 
 // ---- 25 护网条目 ----
 
-func buildKeepnet25(e *store.KeepnetEntry, levelKey string) *proto.Value {
+// rarityOf25 取鱼种稀有度（ecknbkpeeji.f4，jmpghlofkoc：0 普通 1 稀有 2 超稀有）。
+// 结算卡与图鉴按它渲染紫/粉标（icn_rare_* / icn_very_rare_*），缺省为普通。
+func (s *Server) rarityOf25(fishKey string) int64 {
+	return s.DB.SpeciesRarity(s.dbCtx(), fishKey)
+}
+
+func buildKeepnet25(e *store.KeepnetEntry, levelKey string, rarity int64) *proto.Value {
 	if e.KeepLevel != "" {
 		levelKey = e.KeepLevel
 	}
@@ -1455,6 +1482,7 @@ func buildKeepnet25(e *store.KeepnetEntry, levelKey string) *proto.Value {
 		1: proto.U32(uint32(e.WeightG)),
 		2: proto.U32(lengthBits),
 		3: proto.U32(uint32(grade)),
+		4: proto.U32(uint32(rarity)),
 		5: proto.U64(updated),
 		6: wiregen.MustMakeObj("bncmdhbgahe", map[int]*proto.Value{
 			0: proto.U32(uint32(day)),
