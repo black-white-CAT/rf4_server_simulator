@@ -625,7 +625,7 @@
             <h2>上传玩家头像</h2>
             <p>
               支持 PNG、JPEG、GIF，最大 5 MiB。确认客户端可访问上方
-              URL；上传后重启 gameserver 生效。
+              URL；上传后会自动刷新在线玩家档案。
             </p>
           </div>
           <div class="avatar-editor">
@@ -914,7 +914,7 @@
           renderAvatarConfig({ avatar_url: data.url });
           fileInput.value = "";
           setAvatarNotice(
-            "上传成功。请重启 gameserver 后让新头像生效。确认客户端可以访问上方 URL。",
+            "头像已上传并提交在线档案刷新。确认客户端可以访问上方 URL；若玩家仍看到旧图，请重新登录。",
             "ok",
           );
         } catch (e) {

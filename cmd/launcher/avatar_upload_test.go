@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"image"
 	"image/color"
@@ -16,6 +17,7 @@ import (
 	"testing"
 
 	"rf4server/internal/config"
+	"rf4server/internal/store"
 
 	"gopkg.in/yaml.v3"
 )
@@ -26,11 +28,20 @@ func TestHandleAvatarUploadAndServe(t *testing.T) {
 	if err := os.WriteFile(configPath, []byte("# preserve this comment\ngateway:\n  advertise_host: 127.0.0.1\ngame:\n  obs_addr: ':9502'\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	db, err := store.Open(filepath.Join(dir, "avatar.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := db.Migrate(); err != nil {
+		t.Fatal(err)
+	}
 	a := &app{
 		cfg:        &config.Config{Gateway: config.Gateway{AdvertiseHost: "127.0.0.1"}},
 		cfgPath:    configPath,
 		avatarDir:  filepath.Join(dir, "avatars"),
 		avatarPort: 8090,
+		adminDB:    db,
 	}
 	req := avatarUploadRequest(t, "http://127.0.0.1:8090/avatars/avatar.png", testAvatarPNGWithColor(t, color.RGBA{R: 255, A: 255}))
 	rr := httptest.NewRecorder()
@@ -46,7 +57,7 @@ func TestHandleAvatarUploadAndServe(t *testing.T) {
 	if err != nil || firstURL.Path != avatarImagePath || len(firstURL.Query().Get("v")) != 64 {
 		t.Fatalf("avatar URL=%q", response["url"])
 	}
-
+	assertAvatarUpdateQueued(t, db, response["url"])
 	configData, err := os.ReadFile(configPath)
 	if err != nil {
 		t.Fatal(err)
@@ -88,6 +99,8 @@ func TestHandleAvatarUploadAndServe(t *testing.T) {
 	if response["url"] == firstURL.String() {
 		t.Fatalf("new avatar kept cached URL %q", response["url"])
 	}
+	assertAvatarUpdateQueued(t, db, response["url"])
+
 	rr = httptest.NewRecorder()
 	a.handleAvatarImage(rr, httptest.NewRequest(http.MethodGet, response["url"], nil))
 	served, err = png.Decode(bytes.NewReader(rr.Body.Bytes()))
@@ -99,7 +112,23 @@ func TestHandleAvatarUploadAndServe(t *testing.T) {
 		t.Fatalf("served second avatar pixel=(%x,%x,%x), want blue", r, g, b)
 	}
 }
-
+func assertAvatarUpdateQueued(t *testing.T, db *store.DB, wantURL string) {
+	t.Helper()
+	raw, ok, err := db.QueuePop(context.Background())
+	if err != nil || !ok {
+		t.Fatalf("avatar update command missing: ok=%v err=%v", ok, err)
+	}
+	var cmd struct {
+		Op   string `json:"op"`
+		Text string `json:"text"`
+	}
+	if err := json.Unmarshal([]byte(raw), &cmd); err != nil {
+		t.Fatal(err)
+	}
+	if cmd.Op != "update_avatar" || cmd.Text != wantURL {
+		t.Fatalf("avatar update command=%+v, want URL %q", cmd, wantURL)
+	}
+}
 func TestHandleAvatarUploadRejectsInvalidImageAndCrossOrigin(t *testing.T) {
 	a := &app{
 		cfg:       &config.Config{Gateway: config.Gateway{AdvertiseHost: "127.0.0.1"}},

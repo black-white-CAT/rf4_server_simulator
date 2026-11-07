@@ -45,9 +45,11 @@ type Server struct {
 	dispatch *Dispatch
 	DB       *store.DB // 可空：模板兜底降级（生产由 cmd 装配）
 
-	mu       sync.Mutex
-	sessions map[uint64]*Session // 网关 sid -> 会话
-	byToken  map[string]*Session // 活跃会话（重连接管）
+	avatarMu  sync.RWMutex
+	avatarURL string
+	mu        sync.Mutex
+	sessions  map[uint64]*Session // 网关 sid -> 会话
+	byToken   map[string]*Session // 活跃会话（重连接管）
 
 	callMu  sync.Mutex
 	callSeq map[string]uint64 // token -> 已分配的最大推送 call_id
@@ -94,6 +96,7 @@ func NewServer(cfg config.Game, log *slog.Logger, obs *metrics.Server) *Server {
 	initMetrics(reg)
 	s := &Server{
 		cfg:             cfg,
+		avatarURL:       cfg.AvatarURL,
 		log:             log,
 		table:           wiregen.Table(),
 		sessions:        map[uint64]*Session{},
@@ -106,6 +109,17 @@ func NewServer(cfg config.Game, log *slog.Logger, obs *metrics.Server) *Server {
 	s.dispatch = NewDispatch(s)
 	registerHandlers(s.dispatch)
 	return s
+}
+func (s *Server) currentAvatarURL() string {
+	s.avatarMu.RLock()
+	defer s.avatarMu.RUnlock()
+	return s.avatarURL
+}
+
+func (s *Server) setAvatarURL(value string) {
+	s.avatarMu.Lock()
+	s.avatarURL = value
+	s.avatarMu.Unlock()
 }
 
 // SetDB 接入 PG 并加载缓存（测试/装配用）。

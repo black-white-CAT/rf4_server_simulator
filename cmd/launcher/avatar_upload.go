@@ -2,8 +2,10 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"image"
 	_ "image/gif"
@@ -18,6 +20,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
@@ -106,7 +109,33 @@ func (a *app) handleAvatarUpload(w http.ResponseWriter, r *http.Request) {
 	if a.cfg != nil {
 		a.cfg.Game.AvatarURL = avatarURL
 	}
+	if err := a.enqueueAvatarUpdate(avatarURL); err != nil {
+		writeJSONStatus(w, http.StatusInternalServerError, map[string]string{
+			"error": "头像已保存，但在线刷新指令投递失败，请重启 gameserver 后生效: " + err.Error(),
+		})
+		return
+	}
 	writeJSON(w, map[string]string{"url": avatarURL})
+}
+func (a *app) enqueueAvatarUpdate(avatarURL string) error {
+	a.adminMu.RLock()
+	defer a.adminMu.RUnlock()
+	if a.adminDB == nil {
+		return fmt.Errorf("管理数据库尚未就绪")
+	}
+	payload, err := json.Marshal(struct {
+		Op   string `json:"op"`
+		Text string `json:"text"`
+	}{Op: "update_avatar", Text: avatarURL})
+	if err != nil {
+		return fmt.Errorf("编码头像刷新指令: %w", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := a.adminDB.QueuePush(ctx, string(payload)); err != nil {
+		return fmt.Errorf("写入管理指令队列: %w", err)
+	}
+	return nil
 }
 
 func (a *app) handleAvatarImage(w http.ResponseWriter, r *http.Request) {

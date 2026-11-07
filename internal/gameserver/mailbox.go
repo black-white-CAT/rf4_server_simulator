@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -900,6 +901,25 @@ func (s *Server) execAdminCmd(cmd *AdminCommand) {
 			sess.Push2_1()
 		}
 		s.log.Info("管理指令：刷新玩家档案", "uid", cmd.UID)
+	case "update_avatar":
+		avatarURL, err := url.ParseRequestURI(cmd.Text)
+		if err != nil || avatarURL.Scheme != "http" || avatarURL.Hostname() == "" || avatarURL.Path != "/avatars/avatar.png" {
+			s.log.Warn("管理指令：头像 URL 无效")
+			break
+		}
+		s.setAvatarURL(cmd.Text)
+		s.mu.Lock()
+		targets := make([]*Session, 0, len(s.sessions))
+		for _, sess := range s.sessions {
+			if sess != nil && !sess.Closed() {
+				targets = append(targets, sess)
+			}
+		}
+		s.mu.Unlock()
+		for _, sess := range targets {
+			sess.Push2_1()
+		}
+		s.log.Info("管理指令：头像已更新并推送档案", "sessions", len(targets))
 	case "refresh_skills":
 		for _, sess := range s.sessionsForUID(cmd.UID) {
 			sess.Push2_4SkillTree("admin refresh")
