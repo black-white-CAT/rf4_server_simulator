@@ -62,6 +62,10 @@ type app struct {
 	avatarDir  string
 	avatarPort int
 	avatarLn   net.Listener
+	updates    *updatecheck.Checker
+
+	updateHealthMu    sync.RWMutex
+	updateHealthState updateHealth
 	// 托盘状态：systray 在 Run 之前内部句柄为 nil，提前调用 SetIcon/
 	// SetTooltip 会 panic。这里先记录期望状态，托盘就绪后再应用。
 	trayMu    sync.Mutex
@@ -372,6 +376,10 @@ func (a *app) handleStatus(w http.ResponseWriter, _ *http.Request) {
 	a.adminMu.RUnlock()
 	gamePath, gameRegion := a.gameState()
 	avatarBaseURL := a.suggestedAvatarBaseURL()
+	var update *updatecheck.Result
+	if a.updates != nil {
+		update = a.updates.Result()
+	}
 
 	writeJSON(w, map[string]any{
 		"procs":           procs,
