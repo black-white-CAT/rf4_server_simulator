@@ -16,8 +16,11 @@ import (
 	"rf4server/internal/store"
 )
 
-const testBundleID = "AV_shamp1_pack_6_8"
-const testBundleContentsID = "AV_shamp_1l_8"
+// 展开路径夹具用 ieopbeejfmc 为空的官服即拆类饵料盒；ieopbeejfmc=true 的
+// 组合包（原夹具 AV_shamp1_pack_6_8、礼盒 box_feeder_pro）走礼盒路径，
+// 见 giftbox_use_test.go。
+const testBundleID = "box_food_egg_10"
+const testBundleContentsID = "food_egg"
 
 var bundleTestDBTemplate struct {
 	once sync.Once
@@ -118,7 +121,7 @@ func assertBundleContents(t *testing.T, srv *Server, uid, quantity int64) {
 		}
 		total += row.Qty
 		if row.WireClass != "aafdnnmleob" || row.TypeID != 128 {
-			t.Errorf("包内饮料类型错误: %s/%d", row.WireClass, row.TypeID)
+			t.Errorf("包内物类型错误: %s/%d", row.WireClass, row.TypeID)
 		}
 		assertBundleItemQuantity(t, row, row.Qty)
 	}
@@ -136,6 +139,7 @@ func assertBundleMailUnclaimed(t *testing.T, db *store.DB, uid, id int64) {
 }
 
 func TestBundleMailClaimExpandsAndDoesNotDuplicate(t *testing.T) {
+	t.Parallel()
 	srv, db := newBundleTestServer(t)
 	const uid = int64(4101)
 	id, err := db.MailInsert(context.Background(), uid, 0, 0, "test", []store.MailItem{{ItemID: testBundleID, Qty: 2}})
@@ -146,14 +150,15 @@ func TestBundleMailClaimExpandsAndDoesNotDuplicate(t *testing.T) {
 	if count, _ := srv.acceptMails(c, []int64{id, id}); count != 1 {
 		t.Fatalf("领取物品条数=%d", count)
 	}
-	assertBundleContents(t, srv, uid, 24)
+	assertBundleContents(t, srv, uid, 20)
 	if count, _ := srv.acceptMails(c, []int64{id}); count != 0 {
 		t.Errorf("重复领取物品条数=%d", count)
 	}
-	assertBundleContents(t, srv, uid, 24)
+	assertBundleContents(t, srv, uid, 20)
 }
 
 func TestBundleMailClaimFailureRollsBack(t *testing.T) {
+	t.Parallel()
 	srv, db := newBundleTestServer(t)
 	const uid = int64(4102)
 	var ids []int64
@@ -168,7 +173,7 @@ func TestBundleMailClaimFailureRollsBack(t *testing.T) {
 		ids = append(ids, id)
 	}
 	if _, err := db.SQL.Exec(`CREATE TRIGGER reject_bundle_content BEFORE INSERT ON item
-		WHEN NEW.item_id='AV_shamp_1l_8' BEGIN SELECT RAISE(ABORT,'test bundle failure'); END`); err != nil {
+		WHEN NEW.item_id='food_egg' BEGIN SELECT RAISE(ABORT,'test bundle failure'); END`); err != nil {
 		t.Fatal(err)
 	}
 	if count, _ := srv.acceptMails(economyTestCtx(srv, uid, proto.Args524()), ids); count != 0 {
@@ -184,6 +189,7 @@ func TestBundleMailClaimFailureRollsBack(t *testing.T) {
 }
 
 func TestBundleMailNonStackableContentsAreSeparateItems(t *testing.T) {
+	t.Parallel()
 	srv, db := newBundleTestServer(t)
 	seedEconomyItemDef(t, db, 990001, "test_tool_bundle", bundleCategory)
 	if _, err := db.SQL.Exec(`UPDATE item_def SET attrs_json=? WHERE item_id='test_tool_bundle'`,
@@ -214,6 +220,7 @@ func TestBundleMailNonStackableContentsAreSeparateItems(t *testing.T) {
 }
 
 func TestBundleMailLegacySnapshotExpands(t *testing.T) {
+	t.Parallel()
 	srv, db := newBundleTestServer(t)
 	const uid = int64(4110)
 	att := legacyBundleMailSnapshot(t, srv, uid-1)
@@ -233,14 +240,15 @@ func TestBundleMailLegacySnapshotExpands(t *testing.T) {
 	if count, _ := srv.acceptMails(economyTestCtx(srv, uid, proto.Args524()), []int64{id}); count != 1 {
 		t.Fatalf("快照组合包领取物品条数=%d", count)
 	}
-	assertBundleContents(t, srv, uid, 24)
+	assertBundleContents(t, srv, uid, 20)
 	if count, _ := srv.acceptMails(economyTestCtx(srv, uid, proto.Args524()), []int64{id}); count != 0 {
 		t.Errorf("重复领取快照组合包: %d", count)
 	}
-	assertBundleContents(t, srv, uid, 24)
+	assertBundleContents(t, srv, uid, 20)
 }
 
 func TestBundleInvalidDefinitionsDoNotGrantItems(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name, attrs, childAttrs string
 		packs                   int64
@@ -295,6 +303,7 @@ func TestBundleInvalidDefinitionsDoNotGrantItems(t *testing.T) {
 }
 
 func TestBundleMailRejectsPaidOrIncompleteSnapshot(t *testing.T) {
+	t.Parallel()
 	for _, incomplete := range []bool{false, true} {
 		t.Run(strconv.FormatBool(incomplete), func(t *testing.T) {
 			srv, db := newBundleTestServer(t)
@@ -328,6 +337,7 @@ func TestBundleMailRejectsPaidOrIncompleteSnapshot(t *testing.T) {
 }
 
 func TestBundleStorePurchaseAndFailureAreAtomic(t *testing.T) {
+	t.Parallel()
 	for _, name := range []string{"success", "insert_failure", "invalid_definition"} {
 		t.Run(name, func(t *testing.T) {
 			srv, db := newBundleTestServer(t)
@@ -343,7 +353,7 @@ func TestBundleStorePurchaseAndFailureAreAtomic(t *testing.T) {
 			}
 			if name == "insert_failure" {
 				if _, err := db.SQL.Exec(`CREATE TRIGGER reject_store_bundle BEFORE INSERT ON item
-					WHEN NEW.item_id='AV_shamp_1l_8' BEGIN SELECT RAISE(ABORT,'test store failure'); END`); err != nil {
+					WHEN NEW.item_id='food_egg' BEGIN SELECT RAISE(ABORT,'test store failure'); END`); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -368,7 +378,7 @@ func TestBundleStorePurchaseAndFailureAreAtomic(t *testing.T) {
 			if err := db.SQL.QueryRow(`SELECT COUNT(*) FROM txn WHERE uid=? AND kind='buy'`, uid).Scan(&txns); err != nil {
 				t.Fatal(err)
 			}
-			wantQty, wantSilver, wantTxns := int64(12), int64(900), int64(1)
+			wantQty, wantSilver, wantTxns := int64(10), int64(900), int64(1)
 			if fail {
 				wantQty, wantSilver, wantTxns = 0, 1000, 0
 			}
@@ -381,6 +391,7 @@ func TestBundleStorePurchaseAndFailureAreAtomic(t *testing.T) {
 }
 
 func TestBundleMailOverflowPreservesExistingStack(t *testing.T) {
+	t.Parallel()
 	srv, db := newBundleTestServer(t)
 	ctx := context.Background()
 	const uid = int64(4114)
@@ -406,6 +417,7 @@ func TestBundleMailOverflowPreservesExistingStack(t *testing.T) {
 }
 
 func TestBundleUnsupportedContentsPreserveMail(t *testing.T) {
+	t.Parallel()
 	srv, db := newBundleTestServer(t)
 	seedEconomyItemDef(t, db, 990003, "test_unsupported_child", 999)
 	if _, err := db.SQL.Exec(`UPDATE item_def SET attrs_json=? WHERE item_id=?`,
@@ -428,6 +440,7 @@ func TestBundleUnsupportedContentsPreserveMail(t *testing.T) {
 }
 
 func TestBundleMetaQuantityAndMirrors(t *testing.T) {
+	t.Parallel()
 	for _, category := range []int64{19, 20, 45, 58} {
 		t.Run(strconv.FormatInt(category, 10), func(t *testing.T) {
 			srv, db := newBundleTestServer(t)
@@ -478,5 +491,47 @@ func TestBundleMetaQuantityAndMirrors(t *testing.T) {
 				t.Error("权威数量槽溢出必须拒绝")
 			}
 		})
+	}
+}
+
+// TestBundleAbsoluteQuantityHonorsFlag 条目 mlapkoadfnh=true 时数量为绝对个数，
+// 不乘子物定义默认量；缺省条目维持乘法。SKU 用真实静态库：
+// box_worm_asurv_100（worm_asurv def ljnnpokapig=30，flag=true → 应发 100 而非
+// 3000，实机事故回归）、box_bloodworm_10（flag 缺省 → 30×10=300，价格自洽）。
+// 官服语义见客户端 ahoacflhhno.ekfefhbgegl：flag 真直接返回条目数，否则乘 def 0x78。
+func TestBundleAbsoluteQuantityHonorsFlag(t *testing.T) {
+	srv, _ := newBundleTestServer(t)
+	const uid = int64(4117)
+	items, err := srv.prepareBundleItems(context.Background(), uid, "box_worm_asurv_100", "backpack", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 1 || items[0].ItemID != "worm_asurv" {
+		t.Fatalf("蚯蚓盒应展开为一行 worm_asurv: %+v", items)
+	}
+	assertBundleItemQuantity(t, items[0], 100)
+
+	bw, err := srv.prepareBundleItems(context.Background(), uid, "box_bloodworm_10", "backpack", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(bw) != 1 || bw[0].ItemID != "bloodworm" {
+		t.Fatalf("血虫盒应展开为一行 bloodworm: %+v", bw)
+	}
+	assertBundleItemQuantity(t, bw[0], 300)
+}
+
+// TestBundleAbsoluteQuantityOverflowRejected 绝对个数条目超数量槽上限必须拒绝。
+func TestBundleAbsoluteQuantityOverflowRejected(t *testing.T) {
+	srv, db := newBundleTestServer(t)
+	seedEconomyItemDef(t, db, 990004, "test_abs_bundle", bundleCategory)
+	seedEconomyItemDef(t, db, 990005, "test_abs_child", 27)
+	if _, err := db.SQL.Exec(`UPDATE item_def SET attrs_json=? WHERE item_id=?`,
+		`{"nbkhfhenbag":[{"cemjmlpafmc":"test_abs_child","ljnnpokapig":4294967296,"mlapkoadfnh":true}]}`,
+		"test_abs_bundle"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := srv.prepareBundleItems(context.Background(), int64(4118), "test_abs_bundle", "backpack", 1); err == nil {
+		t.Error("绝对个数超过 U32 数量槽上限必须拒绝")
 	}
 }

@@ -151,6 +151,21 @@ func TestCraftBatchCapsAndSlotScaling(t *testing.T) {
 		}
 		return u64Of(v.Fields[0].Num) == 1
 	}
+	craftNamed := func(box *handlerBox, recipe string, slots []craftSlot, qty uint64, name string) bool {
+		t.Helper()
+		tree := craftObj8(recipe, slots, qty)
+		tree.Fields[4] = proto.FStr("U16STR", &name)
+		box.tree = proto.Args524(tree)
+		body, ok := box.invoke(t)
+		if !ok {
+			t.Fatalf("%s 未处理", recipe)
+		}
+		v := decodeTreeValue(t, srv, body)
+		if !v.IsKind(proto.KindObj) || v.TypeID != 803 {
+			t.Fatalf("%s 响应应为 803，实得 %v/%d", recipe, v.Kind, v.TypeID)
+		}
+		return u64Of(v.Fields[0].Num) == 1
+	}
 
 	t.Run("窝料钳到60并按份扣料", func(t *testing.T) {
 		uid := int64(2200001)
@@ -185,6 +200,42 @@ func TestCraftBatchCapsAndSlotScaling(t *testing.T) {
 		}
 		if got := countOf(uid, "mix_combi"); got != 30 {
 			t.Fatalf("类目补扣后应剩 30 份混合饲料，实得 %d", got)
+		}
+		// 自定义名称必须原样落进实例名称字段。
+		if !craftNamed(box, "craft_feed_universal", slot, 1, "我的窝料") {
+			t.Fatal("带自定义名称的制作应成功")
+		}
+		var feedFields string
+		if err := db.SQL.QueryRowContext(ctx,
+			`SELECT fields_json FROM item WHERE uid=? AND item_id='feedcompleted' AND qty=60
+			 ORDER BY created_ts DESC LIMIT 1`,
+			uid).Scan(&feedFields); err != nil {
+			t.Fatal(err)
+		}
+		fields, err := FieldsFromJSON(feedFields)
+		if err != nil {
+			t.Fatal(err)
+		}
+		nameIdx := fieldIdxByCS("cilmgoaoofg", csCustomName)
+		if nameIdx < 0 || nameIdx >= len(fields) || fields[nameIdx].Str == nil ||
+			*fields[nameIdx].Str != "我的窝料" {
+			t.Fatalf("成品窝料应保留自定义名称，实得 %v", fields[nameIdx].Str)
+		}
+		// 同一袋料还要记下制作时实际扣掉的原料：客户端只看得到 feedcompleted，
+		// 吸引判定得靠这份实例用料才知道它到底是植物配还是动物配。
+		var feedGUID, matsJSON string
+		if err := db.SQL.QueryRowContext(ctx,
+			`SELECT guid FROM item WHERE uid=? AND item_id='feedcompleted' AND qty=60
+			 ORDER BY created_ts DESC LIMIT 1`, uid).Scan(&feedGUID); err != nil {
+			t.Fatal(err)
+		}
+		if err := db.SQL.QueryRowContext(ctx,
+			`SELECT mats_json FROM groundbait_recipe WHERE instance_guid=?`, feedGUID).Scan(&matsJSON); err != nil {
+			t.Fatalf("自制窝料实例没有记下用料: %v", err)
+		}
+		mats := groundbaitDecodeMaterials(matsJSON)
+		if len(mats) != 1 || mats[0] != "mix_combi" {
+			t.Fatalf("自制窝料应记下实际用料 mix_combi，实得 %q", mats)
 		}
 	})
 
@@ -224,6 +275,34 @@ func TestCraftBatchCapsAndSlotScaling(t *testing.T) {
 			}
 			if want := 200 - c.cap; countOf(uid, "hvz_pva_material") != want {
 				t.Fatalf("PVA 原料应剩 %d，实得 %d", want, countOf(uid, "hvz_pva_material"))
+			}
+			// PVA 棒也要按实例记下实际填充：10/20/50 克规格分别消耗 1/2/5 份干饵，
+			// 吸引判定不能只看水溶网，也不能把三种规格算成同一种饵料。
+			var pvaGUID, matsJSON string
+			if err := db.SQL.QueryRowContext(ctx,
+				`SELECT guid FROM item WHERE uid=? AND item_id=? ORDER BY created_ts DESC LIMIT 1`,
+				uid, c.output).Scan(&pvaGUID); err != nil {
+				t.Fatal(err)
+			}
+			if err := db.SQL.QueryRowContext(ctx,
+				`SELECT mats_json FROM groundbait_recipe WHERE instance_guid=?`, pvaGUID).Scan(&matsJSON); err != nil {
+				t.Fatalf("PVA 棒实例没有记下填充用料: %v", err)
+			}
+			mats := groundbaitDecodeMaterials(matsJSON)
+			dryCount, pvaCount := int64(0), int64(0)
+			for _, id := range mats {
+				switch id {
+				case "feed_dry":
+					dryCount++
+				case "hvz_pva_material":
+					pvaCount++
+				}
+			}
+			if want := c.dryEach * c.cap; dryCount != want {
+				t.Fatalf("PVA %s 应记下 %d 份干饵，实得 %d", c.output, want, dryCount)
+			}
+			if pvaCount != c.cap {
+				t.Fatalf("PVA %s 应记下 %d 份水溶网，实得 %d", c.output, c.cap, pvaCount)
 			}
 			// 再做一组：PVA 不与其他批次合并，应新增一格。
 			if !craft(box, c.recipe, slots, 1) {

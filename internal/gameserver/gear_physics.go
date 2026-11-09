@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync"
 
+	"rf4server/internal/proto"
 	"rf4server/internal/store"
 )
 
@@ -72,6 +73,7 @@ type rigGearIDs struct {
 	ReelGUID            string
 	Line                string
 	Leader              string
+	LeaderGUID          string
 	Leadcore            string
 	LeadcoreGUID        string
 	Connector           string
@@ -93,7 +95,7 @@ type gearPhysicsSpec struct {
 	ConnectorStrengthKg float64 // 独立连接件（cat14）自身拉力
 	ReelPresent         bool
 	ReelDragKg          float64 // 当前耐久阶段下的锁轮承力
-	ReelCurrentDragKg   float64 // 当前摩擦档位下的制动力，第 30 档锁轮时等于锁轮承力
+	ReelCurrentDragKg   float64 // 当前摩擦档位下的制动力，线上 29（UI 30）锁轮时等于锁轮承力
 	LineStretch         float64
 	HookPresent         bool
 	HookStrengthKg      float64
@@ -244,6 +246,107 @@ func leaderStrengthKg(def *store.ItemDef) float64 {
 	return itemDefF32(def, gearAttrMaxLoad)
 }
 
+// craftedLeaderBaseStrengthKg 读取自制引线（leader_crafted_*）实例上的材料承力。
+//
+// leaderStrengthKg 只读定义：商店成品前导的定义里 mbnambppbom（内嵌线材）和
+// lbadjgllglo（连接件）自带数值，可以直接取；自制引线的线材与连接件是玩家
+// 制作时才选的，定义里这两个属性都是 null、顶层也没有 kngaaefkpka，
+// 读定义只能得到 0。客户端判定用的是引线实例上的 nlmnpekipjc
+// （制作时写好的最弱材料值），服务端却把整根引线当成"没有这个部件"跳过最弱环。
+// 这里按嵌套材料自己的定义取最弱值，不掺耐久与工艺，
+// 耐久由调用方按引线实例结算。
+func (s *Server) craftedLeaderBaseStrengthKg(ctx context.Context, leaderGUID string) float64 {
+	if s == nil || s.DB == nil || strings.TrimSpace(leaderGUID) == "" {
+		return 0
+	}
+	row, err := s.DB.GetItemByGUID(ctx, leaderGUID)
+	if err != nil || row == nil {
+		return 0
+	}
+	if cls, ok := categoryWireClass[gearCatLeader]; !ok || row.WireClass != cls.Class {
+		return 0
+	}
+	fields, err := FieldsFromJSON(row.FieldsJSON)
+	if err != nil {
+		return 0
+	}
+	return s.craftedLeaderBaseStrengthFromFields(ctx, row.WireClass, fields)
+}
+
+// craftedLeaderBaseStrengthFromFields 从引线对象的内嵌材料取最弱承力。
+// 材料在 f1 前导线、f2 连接件、f3 普通主线（减震引线）三个槽位上。
+//
+// 优先使用内嵌材料对象的 nlmnpekipjc：制作/修复路径已经把“实际材料额定拉力
+// × 材料自身耐久 × 材料工艺”写在这里。旧实现只按 numeric_id 回查定义，
+// 普通主线映射到前导线模型时会丢掉真实材料强度；重新乘材料耐久又容易与
+// 外层引线耐久叠加。只有旧存档缺少该字段时，才按材料定义与内嵌状态回算。
+func (s *Server) craftedLeaderBaseStrengthFromFields(
+	ctx context.Context,
+	class string,
+	fields []proto.Field,
+) float64 {
+	if s == nil || s.DB == nil || len(fields) == 0 {
+		return 0
+	}
+	best := 0.0
+	for _, key := range []string{gearAttrLeaderIn, gearAttrLeaderLock, craftedMainLineKey} {
+		idx := fieldIdxByCS(class, key)
+		if idx < 0 || idx >= len(fields) {
+			continue
+		}
+		obj := fields[idx].Val
+		if obj == nil || obj.Kind != proto.KindObj {
+			continue
+		}
+		strength, ok := wireFloatAt(obj, csStrength)
+		if !ok || strength <= 0 {
+			ni := fieldIdxByCS(obj.Class, csNumericID)
+			if ni < 0 || ni >= len(obj.Fields) || obj.Fields[ni].Num == nil {
+				continue
+			}
+			def, err := s.DB.GetItemDef(ctx, int64(u64Of(obj.Fields[ni].Num)))
+			if err != nil || def == nil {
+				continue
+			}
+			base := itemDefF32(def, gearAttrMaxLoad)
+			if base <= 0 {
+				continue
+			}
+			durability, ok := wireFloatAt(obj, csDurability)
+			if !ok {
+				durability = 1
+			}
+			workmanship, ok := wireFloatAt(obj, csWorkmanship)
+			if !ok {
+				workmanship = 1
+			}
+			strength = base * clampUnit(durability) * clampUnit(workmanship)
+		}
+		if strength > 0 && (best <= 0 || strength < best) {
+			best = strength
+		}
+	}
+	return best
+}
+
+// wireFloatAt 读取 wire 对象上的浮点字段，兼容 FLOAT/DOUBLE 与 U32 位型。
+func wireFloatAt(obj *proto.Value, key string) (float64, bool) {
+	if obj == nil || obj.Kind != proto.KindObj {
+		return 0, false
+	}
+	idx := fieldIdxByCS(obj.Class, key)
+	if idx < 0 || idx >= len(obj.Fields) {
+		return 0, false
+	}
+	if fieldIsFloat(obj.Class, idx) {
+		return obj.Fields[idx].Float, true
+	}
+	if fieldOpAt(obj.Class, idx) != "U32" || obj.Fields[idx].Num == nil {
+		return 0, false
+	}
+	return float64(proto.F32FromBits(uint32(u64Of(obj.Fields[idx].Num)))), true
+}
+
 func reelDragMaxKg(def *store.ItemDef) float64 {
 	if def == nil {
 		return 0
@@ -258,40 +361,66 @@ func reelGearRatio(def *store.ItemDef) float64 {
 	return nestedF32(itemDefNested(def, gearAttrGear), gearAttrRatio)
 }
 
-// 渔轮摩擦档位：1~29 是制动力刻度，第 30 档是锁轮。
+// 渔轮摩擦档位：17/14 线上值从 0 开始，客户端 UI 显示值 = 线上值 + 1。
+// 线上 0~28（UI 1~29）是制动力刻度，线上 29（UI 30）是锁轮。
 const (
-	fullReelDragStop = 29
-	maxReelDragStop  = 30
+	fullReelDragStop = 29 // UI 1~29 的满刻度
+	maxReelDragStop  = 29 // 线上 29 = UI 30 = 锁轮
+	// 每根竿的默认摩擦档位：线上 15 = UI 16。客户端未上报过 17/14
+	// 时按这个值下发和计算，不能把“没有记录”当成锁轮。
+	defaultReelDragSetting = int64(15)
 )
 
 // reelDragAtSetting 按摩擦档位给出实际作用在线上的制动力。
-// 1~29 档超过该值时渔轮打滑放线，竿与线不会承受高于它的张力；
-// 第 30 档锁轮后不再打滑，张力上限换成锁轮承力。
+// 线上 0~28 超过该值时渔轮打滑放线，竿与线不会承受高于它的张力；
+// 线上 29 锁轮后不再打滑，张力上限换成锁轮承力。
 func reelDragAtSetting(perf *store.ReelPerformance, setting int64) float64 {
 	if setting >= maxReelDragStop {
 		return perf.LockedDragKg
 	}
-	if setting <= 0 {
+	if setting < 0 {
 		return 0
 	}
-	return perf.BaseDragKg * float64(setting) / float64(fullReelDragStop) * perf.BearingFactor
+	return perf.BaseDragKg * float64(setting+1) / float64(fullReelDragStop) * perf.BearingFactor
 }
 
-// rodReelDragSetting 读取客户端 17/14 保存的摩擦档位；没有记录时返回 false。
+// rodReelDragSetting 读取客户端 17/14 保存的摩擦档位；没有记录时使用默认
+// 线上 15（UI 16），不能回退到锁轮。
 func (s *Server) rodReelDragSetting(ctx context.Context, rodGUID string) (int64, bool) {
+	if s == nil || s.DB == nil || strings.TrimSpace(rodGUID) == "" {
+		return defaultReelDragSetting, true
+	}
+	raw, err := s.DB.GetRodSetting(ctx, rodGUID, reelDragSettingKey)
+	if err != nil || strings.TrimSpace(raw) == "" {
+		return defaultReelDragSetting, true
+	}
+	setting, cerr := strconv.ParseInt(strings.TrimSpace(raw), 10, 64)
+	if cerr != nil {
+		return defaultReelDragSetting, true
+	}
+	// 线上 0 是有效的最小泄力档（UI 1），不能按“没有设置”处理。
+	if setting < 0 {
+		setting = 0
+	}
+	if setting > maxReelDragStop {
+		setting = maxReelDragStop
+	}
+	return setting, true
+}
+
+// rodReelSpeedSetting 读取客户端 17/15 保存的收线速度；没有记录时返回 false。
+// 收线速度不是摩擦档位，不能按 maxReelDragStop 截断（抓包实测值 41）。
+func (s *Server) rodReelSpeedSetting(ctx context.Context, rodGUID string) (int64, bool) {
 	if s == nil || s.DB == nil || strings.TrimSpace(rodGUID) == "" {
 		return 0, false
 	}
-	raw, err := s.DB.GetRodSetting(ctx, rodGUID, reelDragSettingKey)
+	raw, err := s.DB.GetRodSetting(ctx, rodGUID, reelSpeedSettingKey)
 	if err != nil {
 		return 0, false
 	}
 	setting, cerr := strconv.ParseInt(strings.TrimSpace(raw), 10, 64)
-	if cerr != nil || setting <= 0 {
+	if cerr != nil || setting < 0 {
 		return 0, false
-	}
-	if setting > maxReelDragStop {
-		setting = maxReelDragStop
 	}
 	return setting, true
 }
@@ -489,16 +618,39 @@ func (s *Server) loadGearSpec(ctx context.Context, ids rigGearIDs) gearPhysicsSp
 	spec.RodPowerKg = applyDurability(rodPowerKg(load(ids.Rod)), ids.RodDurability)
 	s.logMissingRodPhysics(ids.Rod, load(ids.Rod))
 	spec.ReelPresent = strings.TrimSpace(ids.Reel) != ""
-	if spec.ReelPresent {
-		spec.ReelDragKg = reelDragMaxKg(load(ids.Reel)) * reelLockMultiplier(ids.ReelDurability)
-	}
+	spec.ReelDragKg = s.reelLockedDragForSpec(ctx, ids, load(ids.Reel))
 	lineDef := load(ids.Line)
 	spec.LineStrengthKg = applyDurability(lineStrengthKg(lineDef), ids.LineDurability)
 	spec.LineStretch = lineStretch(lineDef)
-	spec.LeaderStrengthKg = applyDurability(leaderStrengthKg(load(ids.Leader)), ids.LeaderDurability)
+	// 自制引线（leader_crafted_*）的定义里内嵌线材与连接件都是 null：
+	// 材料是玩家制作时才选的，只有实例上才有。读定义会得到 0，
+	// 于是整根引线不进入最弱环，客户端按引线强度报 17/9、
+	// 服务端却把断件判到主线/鱼竿/渔轮上（爆错件）。
+	leaderKg := leaderStrengthKg(load(ids.Leader))
+	if leaderKg <= 0 {
+		leaderKg = s.craftedLeaderBaseStrengthKg(ctx, ids.LeaderGUID)
+	}
+	spec.LeaderStrengthKg = applyDurability(leaderKg, ids.LeaderDurability)
 	spec.LeadcoreStrengthKg = applyDurability(itemDefF32(load(ids.Leadcore), gearAttrMaxLoad), ids.LeadcoreDurability)
 	spec.ConnectorStrengthKg = applyDurability(itemDefF32(load(ids.Connector), gearAttrMaxLoad), ids.ConnectorDurability)
 	return spec
+}
+
+// reelLockedDragForSpec 给搏鱼与抛投裁决取渔轮此刻的锁轮承力：优先读实例（已磨损的摩擦片
+// 与当前零件耐久），读不到才退回定义制动力 x 本体耐久倍率。定义值不反映磨损，直接用它
+// 会留下"摩擦片磨了但力度上限不动"的两套数字，满红不爆只修好一半。
+func (s *Server) reelLockedDragForSpec(ctx context.Context, ids rigGearIDs, def *store.ItemDef) float64 {
+	if strings.TrimSpace(ids.Reel) == "" {
+		return 0
+	}
+	if ids.ReelGUID != "" {
+		if row, err := s.DB.GetItemByGUID(ctx, ids.ReelGUID); err == nil && row != nil {
+			if locked := s.reelLockedDragFromRow(ctx, row); locked > 0 {
+				return locked
+			}
+		}
+	}
+	return reelDragMaxKg(def) * reelLockMultiplier(ids.ReelDurability)
 }
 
 // loadGearSpecForRig 在竿/轮/线/前导之外读取当前线末端鱼钩。
@@ -510,12 +662,8 @@ func (s *Server) loadGearSpecForRig(ctx context.Context, ids rigGearIDs, rodGUID
 			if perf, perr := s.syncReelPerformance(ctx, row); perr == nil {
 				spec.ReelPresent = true
 				spec.ReelDragKg = perf.LockedDragKg
-				if setting, ok := s.rodReelDragSetting(ctx, rodGUID); ok {
-					spec.ReelCurrentDragKg = reelDragAtSetting(perf, setting)
-				} else {
-					// 客户端还没保存过摩擦档位时只有锁轮数据可用，按锁轮兜底。
-					spec.ReelCurrentDragKg = perf.LockedDragKg
-				}
+				setting, _ := s.rodReelDragSetting(ctx, rodGUID)
+				spec.ReelCurrentDragKg = reelDragAtSetting(perf, setting)
 			}
 		}
 	}
@@ -624,9 +772,11 @@ func (s *Server) rigGearIDs(ctx context.Context, uid int64, rodGUID string) rigG
 	out.ReelGUID = compGUIDs[gearCatReel]
 	out.Reel, out.ReelDurability = s.itemSystemIDDurabilityByGUID(ctx, out.ReelGUID)
 	out.Line, out.LineDurability = s.itemSystemIDDurabilityByGUID(ctx, compGUIDs[gearCatLine])
-	out.Leader, out.LeaderDurability = s.itemSystemIDDurabilityByGUID(ctx, compGUIDs[gearCatLeaderWire])
+	out.LeaderGUID = compGUIDs[gearCatLeaderWire]
+	out.Leader, out.LeaderDurability = s.itemSystemIDDurabilityByGUID(ctx, out.LeaderGUID)
 	if out.Leader == "" {
-		out.Leader, out.LeaderDurability = s.itemSystemIDDurabilityByGUID(ctx, compGUIDs[gearCatLeader])
+		out.LeaderGUID = compGUIDs[gearCatLeader]
+		out.Leader, out.LeaderDurability = s.itemSystemIDDurabilityByGUID(ctx, out.LeaderGUID)
 	}
 	// 铅芯前导与独立连接件是和前导/子线并列的终端承力件，各自有拉力，
 	// 不能混进"Leader"里算，否则最弱环会漏掉它们。

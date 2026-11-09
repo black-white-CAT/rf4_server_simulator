@@ -107,6 +107,15 @@ func craftOutputMerges(def *store.ItemDef) bool {
 	return def.Category != 46 && def.Category != 30
 }
 
+// appendMaterialUses 按实际扣掉的件数记录用料。PVA 棒的 10/20/50 克规格
+// 分别装 1/2/5 份干饵，只记一次会让大棒和小棒的成分比例失真。
+func appendMaterialUses(dst []string, itemID string, qty int64) []string {
+	for i := int64(0); i < qty; i++ {
+		dst = append(dst, itemID)
+	}
+	return dst
+}
+
 // 制作配方对应的技能大类（捕获鱼饵 4 见 baitdig.go）。
 const (
 	craftCookSkillID = 6 // 烹调术
@@ -370,6 +379,32 @@ func (s *Server) resolveRecipe(ctx context.Context, key string) *store.Recipe {
 	return nil
 }
 
+// setItemName 把玩家在制作界面填写的自定义名称写入物品实例。
+// 客户端该字段（phoglfnffah）为空时回落到定义名，非空时原样显示。
+func setItemName(it *store.Item, name string) error {
+	if it == nil {
+		return errors.New("空物品行")
+	}
+	if name == "" {
+		return nil
+	}
+	fields, err := FieldsFromJSON(it.FieldsJSON)
+	if err != nil {
+		return err
+	}
+	idx := fieldIdxByCS(it.WireClass, csCustomName)
+	if idx < 0 || idx >= len(fields) {
+		return fmt.Errorf("物品 %s 没有名称字段", it.ItemID)
+	}
+	fields[idx].Str = &name
+	fj, err := FieldsToJSON(fields)
+	if err != nil {
+		return err
+	}
+	it.FieldsJSON = fj
+	return nil
+}
+
 // ---- 9/1 制作闭环 ----
 
 // hCraft 处理 9/1 制作：解析配方、校验材料、事务内扣料、产出入包并写流水。
@@ -446,6 +481,9 @@ func hCraft(ctx *Ctx) ([]byte, bool) {
 	defer func() { _ = tx.Rollback() }()
 
 	touched := []string{}
+	// usedMats 记下本次真的扣掉了哪些原料 item_id（不是槽里的需求 id）。
+	// 自制窝料的产物没有独立 item_id，只能按实例把用料记下来。
+	usedMats := []string{}
 	var leaderMaterials craftedLeaderMaterials
 	fail := func(reason string, args ...any) ([]byte, bool) {
 		ctx.Log.Warn("9/1 制作失败："+reason, args...)
@@ -487,8 +525,11 @@ func hCraft(ctx *Ctx) ([]byte, bool) {
 						return fail("扣材料失败", "item", accept, "err", cerr)
 					}
 					remaining -= got
-					if got > 0 && !containsGUID(touched, it.GUID) {
-						touched = append(touched, it.GUID)
+					if got > 0 {
+						usedMats = appendMaterialUses(usedMats, it.ItemID, got)
+						if !containsGUID(touched, it.GUID) {
+							touched = append(touched, it.GUID)
+						}
 					}
 				}
 			}
@@ -541,6 +582,7 @@ func hCraft(ctx *Ctx) ([]byte, bool) {
 					return fail("材料不足", "item", row.ItemID, "missing", need-got)
 				}
 				consumed = true
+				usedMats = appendMaterialUses(usedMats, row.ItemID, got)
 				if !containsGUID(touched, row.GUID) {
 					touched = append(touched, row.GUID)
 				}
@@ -585,6 +627,9 @@ func hCraft(ctx *Ctx) ([]byte, bool) {
 						touched = append(touched, it.GUID)
 					}
 					remaining -= got
+					if got > 0 {
+						usedMats = appendMaterialUses(usedMats, it.ItemID, got)
+					}
 					consumed = true
 				}
 				if remaining > 0 || !consumed {
@@ -595,6 +640,10 @@ func hCraft(ctx *Ctx) ([]byte, bool) {
 		if len(touched) == 0 {
 			return fail("配方要求材料但未扣到任何材料")
 		}
+	}
+
+	if err := setItemName(producedRow, req.Name); err != nil {
+		return fail("自定义名称写入失败", "err", err)
 	}
 
 	// 标本挂鱼（事务内）：定位→嵌鱼→消耗一体，任何一步失败整体回滚。
@@ -632,6 +681,15 @@ func hCraft(ctx *Ctx) ([]byte, bool) {
 	if err != nil {
 		return fail("产出物入库失败", "output", outputID, "err", err)
 	}
+	// 自制窝料/PVA 棒：产物在客户端只有一个 item_id（feedcompleted），五个槽怎么
+	// 配都叫这个名字，所以「这袋料到底用了什么」必须按实例记下来。等投进窝里
+	// 再回查就晚了：那份料可能早被吃掉删掉，而窝还要活几个小时。
+	if outputDef != nil && (outputDef.Category == catGroundbaitMix || outputDef.Category == catPVAStick) {
+		if err := groundbaitRecordInstanceMaterialsTx(cctx, tx, row.GUID, usedMats); err != nil {
+			return fail("窝料用料记录写入失败", "err", err)
+		}
+	}
+
 	if err := addTxnTx(cctx, tx, uid, "craft", outputID, "",
 		0, 0, fmt.Sprintf("recipe=%s qty=%d", recipe.RecipeID, times)); err != nil {
 		return fail("制作流水写入失败", "err", err)
@@ -699,6 +757,15 @@ func hCraft(ctx *Ctx) ([]byte, bool) {
 			// 4/22 是背包快照，必须下发合并后的整堆数量。
 			ctx.Sess.Push(4, 22, proto.Args(proto.S("61"), stackTree))
 		}
+	})
+	// 制作成功事件：配方 ID 供 250-417 的制作类成就判断；烹饪熟练度只在
+	// 本次是烹饪配方时装配，非烹饪制作保持 0，技能类成就便不会误判。
+	cookPoints := float64(0)
+	if skillCat == craftCookSkillID {
+		cookPoints, _ = srv.DB.GetSkillPoints(cctx, uid, craftCookSkillID)
+	}
+	srv.evaluateAchievements(ctx, achievementEvent{
+		Kind: evCraftOK, RecipeID: recipe.RecipeID, CookPoints: cookPoints,
 	})
 	return srv.replyCraftResultWithSkill(ctx, true, produced, upsert, removed, progress, skillTree)
 }
@@ -1058,12 +1125,28 @@ func (s *Server) digBaitWithShovel(ctx *Ctx, shovel *store.Item) ([]byte, bool) 
 		prepared = append(prepared, it)
 	}
 
+	// 体力参数必须在开经济事务之前取好（tunableF 首次装载有 2 秒查询超时）。
+	condParams := s.conditionParamsForUID(cctx, ctx.Sess.Userid)
+	condCost := s.baitDigEnergyCost()
+
 	tx, err := beginEconomyTx(cctx, s.DB)
 	if err != nil {
 		ctx.Log.Warn("9/3 挖饵开启事务失败", "err", err)
 		return s.replyCraftResult(ctx, false, nil, nil, nil)
 	}
 	defer func() { _ = tx.Rollback() }()
+
+	// 与饵入包同事务：体力不足直接回滚，不会出现"给了饵没扣体力"。
+	spent, err := spendEnergyTx(cctx, tx, ctx.Sess.Userid, condParams, condCost)
+	if err != nil {
+		if errors.Is(err, errEnergyNotEnough) {
+			ctx.Log.Info("9/3 铲子挖饵被拒：精力不足", "shovel", shortGUID(shovel.GUID),
+				"cost", condCost, "enabled", condParams.Enabled)
+		} else {
+			ctx.Log.Warn("9/3 挖饵精力结算失败", "err", err)
+		}
+		return s.replyCraftResult(ctx, false, nil, nil, nil)
+	}
 
 	granted := make([]*store.Item, 0, len(prepared))
 	parts := make([]string, 0, len(loot))
@@ -1107,7 +1190,11 @@ func (s *Server) digBaitWithShovel(ctx *Ctx, shovel *store.Item) ([]byte, bool) 
 	})
 	skillTree := s.buildSingleSkill312(cctx, ctx.Sess.Userid, baitCatchSkillCat)
 	ctx.Log.Info("9/3 铲子挖饵", "shovel", shortGUID(shovel.GUID), "types", len(loot),
-		"items", strings.Join(parts, ","), "skill_gain", skillGain)
+		"items", strings.Join(parts, ","), "skill_gain", skillGain, "energy_spent", spent)
+	if spent > 0 {
+		// 体力条不在 9/3 应答里，扣完立刻补推一条 2/2。
+		ctx.AfterResponse(func() { pushKeepalive(ctx.Sess) })
+	}
 	return s.replyCraftResultWithSkill(ctx, true, produced, produced, nil, progress, skillTree)
 }
 

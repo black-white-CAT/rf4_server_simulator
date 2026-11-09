@@ -48,6 +48,7 @@ func decodeLocator(t *testing.T, srv *Server, body []byte) (level, scene string)
 // 首次玩家没有位置记录时必须回出生图；1/14 成功后，同进程重连和
 // 进程重启式新 Server 都要从 profile 恢复上次地图。
 func TestPlayerLocationFirstLoginTravelReconnectAndRestart(t *testing.T) {
+	t.Parallel()
 	db := connectTestDB(t)
 	const uid int64 = 1000001
 	srv := newLocationTestServer(t, db)
@@ -120,6 +121,7 @@ func TestPlayerLocationFirstLoginTravelReconnectAndRestart(t *testing.T) {
 
 // 切图必须按目标地图所需银币扣款，同图重入与免费地图不重复收费。
 func TestTravelDeductsMapSilver(t *testing.T) {
+	t.Parallel()
 	db := connectTestDB(t)
 	const uid int64 = 1000002
 	srv := newLocationTestServer(t, db)
@@ -180,6 +182,7 @@ func TestTravelDeductsMapSilver(t *testing.T) {
 
 // 银币不足时回业务失败，既不扣款也不切图。
 func TestTravelInsufficientSilverStaysOnMap(t *testing.T) {
+	t.Parallel()
 	db := connectTestDB(t)
 	const uid int64 = 1000003
 	srv := newLocationTestServer(t, db)
@@ -214,6 +217,7 @@ func TestTravelInsufficientSilverStaysOnMap(t *testing.T) {
 
 // 1/13 带地图 key 同样算一次切图，也要扣该地图的银币。
 func TestEnterMapWithKeyDeductsSilver(t *testing.T) {
+	t.Parallel()
 	db := connectTestDB(t)
 	const uid int64 = 1000005
 	srv := newLocationTestServer(t, db)
@@ -255,6 +259,7 @@ func TestEnterMapWithKeyDeductsSilver(t *testing.T) {
 
 // 已金币买断（无限通行）的地图切图不再收银币。
 func TestTravelBuyoutPlaceIsFree(t *testing.T) {
+	t.Parallel()
 	db := connectTestDB(t)
 	const uid int64 = 1000004
 	srv := newLocationTestServer(t, db)
@@ -288,6 +293,7 @@ func TestTravelBuyoutPlaceIsFree(t *testing.T) {
 
 // 数据库中的地图 key 无效时，1/13 必须返回出生图并修正记录。
 func TestPlayerLocationInvalidMapFallsBackToSpawn(t *testing.T) {
+	t.Parallel()
 	db := connectTestDB(t)
 	const uid int64 = 1000001
 	if err := db.SetPlayerLocation(context.Background(), uid, "level_does_not_exist", "bad_scene", 7); err != nil {
@@ -351,6 +357,7 @@ func travelTestTxns(t *testing.T, db *store.DB, uid int64) int {
 
 // 位置写入失败时，钱包扣款、流水与切图必须一起回滚（审查意见 P1）。
 func TestTravelLocationFailureRollsBackCharge(t *testing.T) {
+	t.Parallel()
 	db := connectTestDB(t)
 	const uid int64 = 1000006
 	srv := newLocationTestServer(t, db)
@@ -391,6 +398,7 @@ func TestTravelLocationFailureRollsBackCharge(t *testing.T) {
 
 // PR #171 合并后，有效钓鱼游期间前往该地图不再收普通切图门票；到期后恢复收费。
 func TestTravelActiveTripIsFree(t *testing.T) {
+	t.Parallel()
 	db := connectTestDB(t)
 	const uid int64 = 1000007
 	srv := newLocationTestServer(t, db)
@@ -454,6 +462,7 @@ func TestTravelActiveTripIsFree(t *testing.T) {
 
 // 房契（place_access kind='house'）同样免普通切图门票。
 func TestTravelHouseAccessIsFree(t *testing.T) {
+	t.Parallel()
 	db := connectTestDB(t)
 	const uid int64 = 1000008
 	srv := newLocationTestServer(t, db)
@@ -479,6 +488,7 @@ func TestTravelHouseAccessIsFree(t *testing.T) {
 
 // 同一玩家两个并发 1/14：事务写锁 + 事务内同图判定，只允许扣一次旅费。
 func TestConcurrentTravelChargesOnce(t *testing.T) {
+	t.Parallel()
 	db := connectTestDB(t)
 	const uid int64 = 1000009
 	srv := newLocationTestServer(t, db)
@@ -542,6 +552,7 @@ func travelTestProfileSilver(t *testing.T, srv *Server, body []byte) int64 {
 
 // 1/14 响应内的档案 307 必须是扣款后的余额，不能用预构造的旧档案覆盖客户端。
 func TestTravelResponseBodyHasChargedSilver(t *testing.T) {
+	t.Parallel()
 	db := connectTestDB(t)
 	const uid int64 = 1000010
 	srv := newLocationTestServer(t, db)
@@ -556,5 +567,169 @@ func TestTravelResponseBodyHasChargedSilver(t *testing.T) {
 	}
 	if got := travelTestProfileSilver(t, srv, body); got != start-cost {
 		t.Fatalf("1/14 档案余额未反映扣款: f7=%d want=%d", got, start-cost)
+	}
+}
+
+// 1/13 带 key 进入付费地图也必须保留银币门票入口，不能因为缺少
+// 买断/钓鱼游就在 settleTravel 之前被弹回出生图。
+func TestEnterMapKeyedPaidMapChargesSilver(t *testing.T) {
+	db := connectTestDB(t)
+	const uid int64 = 1000012
+	target := "level_012_north_sea"
+	if _, ok := placeTripPrices[target]; !ok {
+		t.Fatalf("测试地图未配置钓鱼游价: %s", target)
+	}
+	cost := placeTravelCost(target)
+	const start int64 = 20000
+	seedTravelTestPlayer(t, db, uid, start)
+	srv := newLocationTestServer(t, db)
+	body, ok := hEnterMap(locationTestCtx(locationTestSession(srv, uid),
+		proto.Args524(proto.StrVal(target))))
+	if !ok {
+		t.Fatal("1/13 带 key 进入付费地图未处理")
+	}
+	level, _ := decodeLocator(t, srv, body)
+	if level != target {
+		t.Fatalf("银币票进入回 %q，期望 %q", level, target)
+	}
+	if got := travelTestSilver(t, db, uid); got != start-cost {
+		t.Fatalf("银币票进入后余额=%d，期望 %d", got, start-cost)
+	}
+	if got := travelTestTxns(t, db, uid); got != 1 {
+		t.Fatalf("银币票进入流水=%d，期望 1", got)
+	}
+	if loc, err := db.GetPlayerLocation(context.Background(), uid); err != nil ||
+		loc == nil || loc.LevelKey != target {
+		t.Fatalf("银币票进入未落库: loc=%+v err=%v", loc, err)
+	}
+}
+
+func seedTripStateForLocationTest(t *testing.T, db *store.DB, uid int64, place string,
+	remaining float64, purchases int64, updated float64) {
+	t.Helper()
+	if _, err := db.SQL.Exec(`
+		INSERT INTO trip_state(uid, place, remaining_sec, last_consume_ts, purchases, updated_ts)
+		VALUES(?,?,?,?,?,?)`, uid, place, remaining, updated, purchases, updated); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// 登录恢复应对三种付费地图入口一致：银币票停留、金币买断、有效钓鱼游
+// 都保留上次地图，且空请求不得重复扣银币。
+func TestLoginRestoreKeepsPaidMapByAccessMode(t *testing.T) {
+	const target = "level_012_north_sea"
+	if _, ok := placeTripPrices[target]; !ok {
+		t.Fatalf("测试地图未配置钓鱼游价: %s", target)
+	}
+	cases := []struct {
+		name  string
+		setup func(*testing.T, *store.DB, int64)
+	}{
+		{name: "silver_ticket"},
+		{name: "buyout", setup: func(t *testing.T, db *store.DB, uid int64) {
+			t.Helper()
+			if err := db.PlaceAccessInsert(context.Background(), uid, target, "buyout"); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{name: "active_trip", setup: func(t *testing.T, db *store.DB, uid int64) {
+			t.Helper()
+			seedTripStateForLocationTest(t, db, uid, target, 3600, 1, 1)
+			if err := db.PlaceAccessInsert(context.Background(), uid, target, "trip"); err != nil {
+				t.Fatal(err)
+			}
+		}},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			db := connectTestDB(t)
+			const uid int64 = 1000011
+			const start int64 = 20000
+			seedTravelTestPlayer(t, db, uid, start)
+			if err := db.SetPlayerLocation(context.Background(), uid, target, "", 0); err != nil {
+				t.Fatal(err)
+			}
+			if tc.setup != nil {
+				tc.setup(t, db, uid)
+			}
+			srv := newLocationTestServer(t, db)
+			body, ok := hEnterMap(locationTestCtx(locationTestSession(srv, uid), proto.Args524()))
+			if !ok {
+				t.Fatal("登录恢复 1/13 未处理")
+			}
+			level, _ := decodeLocator(t, srv, body)
+			if level != target {
+				t.Fatalf("登录恢复回 %q，期望保留 %q", level, target)
+			}
+			if got := srv.currentLevel(uid); got != target {
+				t.Fatalf("currentLevel=%q，期望 %q", got, target)
+			}
+			if got := travelTestSilver(t, db, uid); got != start {
+				t.Fatalf("登录恢复重复扣费: silver=%d want=%d", got, start)
+			}
+			if got := travelTestTxns(t, db, uid); got != 0 {
+				t.Fatalf("登录恢复不应产生旅费流水，实得 %d", got)
+			}
+		})
+	}
+}
+
+// 仅靠钓鱼游进入的玩家，游到期且没有后续银币票时必须回出生图。
+func TestLoginRestoreExpiredTripFallsBackToSpawn(t *testing.T) {
+	db := connectTestDB(t)
+	const uid int64 = 1000013
+	const start int64 = 20000
+	target := "level_012_north_sea"
+	seedTravelTestPlayer(t, db, uid, start)
+	seedTripStateForLocationTest(t, db, uid, target, 0, 1, 100)
+	if err := db.SetPlayerLocation(context.Background(), uid, target, "", 0); err != nil {
+		t.Fatal(err)
+	}
+	srv := newLocationTestServer(t, db)
+	body, ok := hEnterMap(locationTestCtx(locationTestSession(srv, uid), proto.Args524()))
+	if !ok {
+		t.Fatal("登录恢复 1/13 未处理")
+	}
+	level, _ := decodeLocator(t, srv, body)
+	if level != spawnLevelKey {
+		t.Fatalf("钓鱼游到期后登录回 %q，期望 %q", level, spawnLevelKey)
+	}
+	if got := srv.currentLevel(uid); got != spawnLevelKey {
+		t.Fatalf("到期后 currentLevel=%q，期望 %q", got, spawnLevelKey)
+	}
+	if loc, err := db.GetPlayerLocation(context.Background(), uid); err != nil ||
+		loc == nil || loc.LevelKey != spawnLevelKey {
+		t.Fatalf("到期后位置未修正: loc=%+v err=%v", loc, err)
+	}
+	if got := travelTestSilver(t, db, uid); got != start {
+		t.Fatalf("到期回出生图不应扣费: silver=%d want=%d", got, start)
+	}
+}
+
+// 钓鱼游到期后玩家又用银币票重新进入并下线，重登仍应保留该地图。
+func TestLoginRestoreExpiredTripWithLaterTicketKeepsMap(t *testing.T) {
+	db := connectTestDB(t)
+	const uid int64 = 1000014
+	target := "level_012_north_sea"
+	seedTravelTestPlayer(t, db, uid, 20000)
+	seedTripStateForLocationTest(t, db, uid, target, 0, 1, 100)
+	if _, err := db.SQL.Exec(`
+		INSERT INTO txn(uid, ts, kind, item_id, silver_delta, gold_delta, note)
+		VALUES(?,?,?,?,?,?,?)`, uid, 200.0, "buy", target,
+		-placeTravelCost(target), 0, "place_travel"); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.SetPlayerLocation(context.Background(), uid, target, "", 0); err != nil {
+		t.Fatal(err)
+	}
+	srv := newLocationTestServer(t, db)
+	body, ok := hEnterMap(locationTestCtx(locationTestSession(srv, uid), proto.Args524()))
+	if !ok {
+		t.Fatal("登录恢复 1/13 未处理")
+	}
+	level, _ := decodeLocator(t, srv, body)
+	if level != target {
+		t.Fatalf("到期后重新买票登录回 %q，期望保留 %q", level, target)
 	}
 }

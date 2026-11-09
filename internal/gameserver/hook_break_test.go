@@ -47,7 +47,7 @@ func TestHookStrengthBreaksHookNotRod(t *testing.T) {
 		t.Fatalf("最弱环=%q，期望 hook", got)
 	}
 
-	decision, err := srv.resolveGearBreak(ctx, uid, rod.GUID, rod.GUID)
+	decision, err := srv.resolveGearBreak(ctx, uid, rod.GUID, hook.GUID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -55,7 +55,7 @@ func TestHookStrengthBreaksHookNotRod(t *testing.T) {
 		t.Fatalf("超载应判断钩: %+v", decision)
 	}
 
-	outcome, err := srv.breakLineOrRod(ctx, uid, rod.GUID, rod.GUID)
+	outcome, err := srv.breakLineOrRod(ctx, uid, rod.GUID, hook.GUID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -64,8 +64,8 @@ func TestHookStrengthBreaksHookNotRod(t *testing.T) {
 	if !outcome.ComponentBroken || outcome.BrokenGUID != hook.GUID {
 		t.Fatalf("断件结果不是钩: %+v", outcome)
 	}
-	if row, _ := db.GetItemByGUID(ctx, hook.GUID); row != nil && row.Durability != 0 {
-		t.Fatalf("断钩后耐久应为 0，实得 %f", row.Durability)
+	if row, _ := db.GetItemByGUID(ctx, hook.GUID); row != nil {
+		t.Fatalf("断钩后钩应被销毁（官服口径），实得 %+v", row)
 	}
 	if row, _ := db.GetItemByGUID(ctx, rod.GUID); row == nil || row.Durability != 1 {
 		t.Fatalf("断钩不应伤到竿: %+v", row)

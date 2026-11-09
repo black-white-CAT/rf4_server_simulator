@@ -11,17 +11,29 @@ import (
 
 // 档案、技能树与推送树构造。
 
-// 通行证与赛季使用的固定时间常量。
+// 通行证使用的固定时间常量。
 const (
 	pass745F2                       = uint64(131765184000000000)
-	season5013F1                    = uint64(134238816000000000)
-	season5013F2                    = uint64(134265924000000000)
 	f32Const801F2                   = uint32(1092571843) // 801.f2 位型
 	castDepthBits                   = uint32(1091032928) // 158.f2 = f32 8.4900818
 	profileFlags                    = uint32(17 | 0x100) // 0x100：跳过绑定邮箱提示
 	defaultPlayerConditionPrimary   = store.DefaultPlayerConditionPrimary
 	defaultPlayerConditionSecondary = store.DefaultPlayerConditionSecondary
 )
+
+// seasonBounds 返回当前赛季的起止 FILETIME。
+// 以每月 22 日 00:00 UTC 为起点滚动到下月 22 日 09:00 UTC，保证时段覆盖当前时刻；
+// 5013 时段过期会让客户端把资格节点判为锁定。
+func seasonBounds() (uint64, uint64) {
+	n := time.Now().UTC()
+	year, month, day := n.Date()
+	start := time.Date(year, month, 22, 0, 0, 0, 0, time.UTC)
+	if day < 22 {
+		start = start.AddDate(0, -1, 0)
+	}
+	end := start.AddDate(0, 1, 0).Add(9 * time.Hour)
+	return uint64(proto.UnixToFiletime(start.Unix())), uint64(proto.UnixToFiletime(end.Unix()))
+}
 
 // BuildPose308 玩家姿态块（2/2 与 307.f12 共用；f7=世界时钟 FILETIME）。
 func BuildPose308() *proto.Value {
@@ -34,16 +46,15 @@ func BuildPose308() *proto.Value {
 }
 
 // buildPose308 使用 SQLite 中的玩家状态构造姿态块；读库失败才回退到协议默认值。
+// 非 2/2 档案响应只读取当前持久化值，不做在线钟推进；环境感知与推进统一由
+// 2/2 保活负责，避免任意 307 以空环境抢走舒适度漂移区间。
+// f3=舒适度、f4=幸运惩罚由 player_condition 透传。
 func (s *Server) buildPose308(ctx context.Context, uid int64) *proto.Value {
-	primary, secondary := defaultPlayerConditionPrimary, defaultPlayerConditionSecondary
-	if s != nil && s.DB != nil {
-		if v, err := s.DB.EnsurePlayerCondition(ctx, uid); err == nil && v != nil {
-			primary, secondary = v.Primary, v.Secondary
-		}
-	}
+	c := s.peekPlayerCondition(ctx, uid)
 	return wiregen.MustMakeObj("pnbphpdmppe", map[int]*proto.Value{
-		0: proto.F32(float32(primary)), 1: proto.F32(float32(secondary)), 2: proto.F32(0.0),
-		3: proto.F32(1.0), 4: proto.F32(0.0), 5: proto.F32(11.375), 6: proto.F32(0.0),
+		0: proto.F32(float32(c.Primary)), 1: proto.F32(float32(c.Secondary)), 2: proto.F32(0.0),
+		3: proto.F32(float32(c.Comfort)), 4: proto.F32(float32(c.LuckPenalty)),
+		5: proto.F32(11.375), 6: proto.F32(0.0),
 		7: proto.U64(uint64(proto.WindowsFiletimeNow())),
 		8: proto.U32(0),
 	})
@@ -91,22 +102,34 @@ func build745() *proto.Value {
 	})
 }
 
-// build5013 构造赛季起止时段。
-func build5013() *proto.Value {
+// build5013 构造一条赛季起止时段。
+// Idx0 是赛季阶段（0=无/哨兵，5=新年活动，6=生日/周年活动）；客户端
+// kkaadaemdkb.bbhdipfopfk 按 Idx0 索引 5013 条目，所以 5012.f0 可同时下发多阶段。
+// 阶段 0 的哨兵条目恒发，供永久资格节点使用；发 6 会点亮主菜单「周年纪念任务」入口。
+//
+// Idx4 是周年面板倒计时的结束时间（iibalkfkhml.nehplcfdejp 从 dto+0x28 读
+// FILETIME 后减当前时间），由后台 event_anniversary_end_unix 配置；
+// 填 0 会让客户端回退到内置 2022-08-06，显示 -1555 天。
+// Idx3 是 OPT（1 字节 flag，PackU8），放不下 FILETIME，交由 wiregen 按 ClassOps 填零。
+func build5013(stage uint32, end uint64) *proto.Value {
+	start, seasonEnd := seasonBounds()
 	return wiregen.MustMakeObj("nkakjeigjla", map[int]*proto.Value{
-		0: proto.U32(6),
-		1: proto.U64(season5013F1),
-		2: proto.U64(season5013F2),
-		3: proto.U32(0),
-		4: proto.U64(0),
+		0: proto.U32(stage),
+		1: proto.U64(start),
+		2: proto.U64(seasonEnd),
+		4: proto.U64(end),
 		5: proto.Null(),
 	})
 }
 
-// build5012 构造包含 5013 的赛季容器。
-func build5012() *proto.Value {
+// build5012 构造包含各阶段 5013 条目的赛季容器。
+func build5012(stages []uint32, end uint64) *proto.Value {
+	items := make([]*proto.Value, 0, len(stages))
+	for _, stage := range stages {
+		items = append(items, build5013(stage, end))
+	}
 	return wiregen.MustMakeObj("fkcmcjlagdh", map[int]*proto.Value{
-		0: proto.Args(proto.S("210"), build5013()),
+		0: proto.Args(proto.S("210"), items...),
 	})
 }
 
@@ -157,10 +180,8 @@ func (s *Server) BuildProfile307W(ctx context.Context, uid int64, wNow int64) (*
 	if p.XP > base {
 		inLevel = uint64(p.XP - base)
 	}
-	// 5012 赛季块
-	season := wiregen.MustMakeObj("fkcmcjlagdh", map[int]*proto.Value{
-		0: proto.Args(proto.S("210"), build5013()),
-	})
+	// 5012 赛季块：阶段与结束时间都取自运行参数。
+	season := s.buildSeason5012()
 
 	avatarURL, err := s.DB.PlayerAvatarURL(ctx, p.UID)
 	if err != nil {
@@ -209,6 +230,16 @@ func (s *Server) BuildProfile307W(ctx context.Context, uid int64, wNow int64) (*
 		}))
 	}
 
+	// f16=kgpgemhhiik 是资料页奖杯鱼种数（trophy/trph），不是布尔值。客户端
+	// 把 f16 拷进 ifbfdldbana.gebeadddmlp；RUIUserInfoWidget（等级旁星号）
+	// 和 ddkpcmhdfdb.fgnijlofipp 都显示该值，24/19 的 f5 是同一字段。官服
+	// 语义按鱼种去重：钓到过 grade>=3（重量稀有/超稀有）的鱼种各计一次，
+	// 不等于统计页 3/2 按条数的稀有渔获计数。
+	rareCatches, rareErr := s.DB.RareSpeciesCount(ctx, uid, 3)
+	if rareErr != nil {
+		s.log.Warn("奖杯鱼种数读取失败，按 0 下发", "uid", uid, "err", rareErr)
+	}
+
 	return wiregen.MakeObj("ghfbofgdflm", map[int]*proto.Value{
 		0:  proto.U32(uint32(p.UID)),
 		1:  proto.StrVal(p.Name),
@@ -226,7 +257,7 @@ func (s *Server) BuildProfile307W(ctx context.Context, uid int64, wNow int64) (*
 		13: buildStats322W(wNow),
 		14: proto.U32(0),
 		15: proto.U32(profileFlags),
-		16: proto.U32(1),
+		16: proto.U32(uint32(rareCatches)),
 		17: proto.StrVal(p.Email),
 		18: proto.U32(uint32(p.Role)),
 		19: proto.U64(uint64(p.Bank)),

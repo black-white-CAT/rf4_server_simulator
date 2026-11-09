@@ -7,10 +7,13 @@ import (
 
 // fishRollContext 只传递本次判鱼的区域和钩上饵，不改动存档格式。
 type fishRollContext struct {
-	x, z       float64
-	hasPos     bool
-	spot       uint64
-	loc        string
+	x, z   float64
+	hasPos bool
+	spot   uint64
+	loc    string
+	// uid 本次判鱼的玩家。窝料账本按 (uid, loc, 落点格子) 结算，
+	// 没有它就查不到窝。
+	uid        int64
 	now        time.Time
 	baits      []string
 	lureBait   bool
@@ -30,6 +33,8 @@ type fishRollContext struct {
 	skill      fishingSkillBonus
 	spotEnv    fishSpotEnvironment
 	runtime    *fishRollRuntime
+	hook       gearPhysicsSpec
+	query      *fishQueryCapture
 }
 
 type fishRollRuntime struct {
@@ -44,6 +49,8 @@ type fishRollRuntime struct {
 	zoneKnown  bool
 	spotPref   map[string]float64
 	spotData   bool
+	// sonarSystemID 是海图声呐档案键（如 loc12_215）；内陆为空。
+	sonarSystemID string
 }
 
 func rollContext(contexts []fishRollContext) fishRollContext {

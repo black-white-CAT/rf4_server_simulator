@@ -11,6 +11,10 @@ import (
 	"rf4server/internal/store"
 )
 
+// foodSatietyFullThreshold：饱食度到这个值就视为“吃饱”，再吃只会浪费物品。
+// 用略低于 1.0 的阈值，避免浮点累加尾差让玩家永远差一点点吃不饱。
+const foodSatietyFullThreshold = 0.995
+
 type drinkUseReceipt struct {
 	BodySHA256     string
 	ExpectResponse bool
@@ -18,7 +22,9 @@ type drinkUseReceipt struct {
 	CreatedAt      int64 `json:"created_at"`
 }
 
-// useAlcoholDrink 将扣物、酒兴和业务回执一起提交；其它物品沿用原处理器。
+// useAlcoholDrink 将扣物、酒兴/消耗品恢复和业务回执一起提交；其它物品沿用原处理器。
+// 酒类按经验加成规则（drink_rules.go），食品/热饮按状态恢复规则
+// （consumableRestoreForItem：咖啡→精力、茶→舒适度、可可→饱食+精力、食品→饱食度）。
 func (s *Server) useAlcoholDrink(ctx *Ctx) ([]byte, bool) {
 	if !s.requireDB(ctx) {
 		return nil, false
@@ -36,6 +42,10 @@ func (s *Server) useAlcoholDrink(ctx *Ctx) ([]byte, bool) {
 		return fail("饮用未完成，请重试")
 	}
 	cctx, uid := ctx.Sess.pushCtx(), ctx.Sess.Userid
+	// tunableF 首次装载有 2 秒超时的表查询，不能发生在持锁事务内
+	//（查询等待锁会超时并静默回退默认值）；统一在开事务前取好状态机参数，
+	// 并叠加当前装备的精力上限/恢复加成。
+	cond := s.conditionParamsForUID(cctx, uid)
 	key, bodySHA := requestReceiptKey(ctx)
 	receiptKey := fmt.Sprintf("drink-use:%d:%s:%d:%d:%d", uid, key.TokenHash, key.Main, key.Sub, key.CallID)
 	var err error
@@ -88,17 +98,25 @@ func (s *Server) useAlcoholDrink(ctx *Ctx) ([]byte, bool) {
 		return failed(err)
 	}
 	rule, isDrink := drinkRuleForItem(def.ItemID)
+	restoreKind, isConsumable := "", false
 	if !isDrink {
+		restoreKind, isConsumable = consumableRestoreForItem(def.ItemID)
+		// 状态机总开关关闭时食品/热饮维持旧行为（落回通用 handler，不扣不恢复）。
+		if isConsumable && !cond.Enabled {
+			isConsumable = false
+		}
+	}
+	if !isDrink && !isConsumable {
 		return nil, false
 	}
 	if ctx.Sess.Closed() {
 		return fail("会话已关闭，请重新连接")
 	}
 	if !hasStorage || storage != 0 || row.UID != uid || row.Container != "backpack" || row.RigGUID != "" {
-		return fail("只能饮用自己背包中的饮品")
+		return fail("只能使用自己背包中的消耗品")
 	}
 	if def.Category != 26 || row.WireClass != "aafdnnmleob" || row.TypeID != 128 {
-		return fail("饮品状态无效，请刷新背包")
+		return fail("消耗品状态无效，请刷新背包")
 	}
 	fields, err := FieldsFromJSON(row.FieldsJSON)
 	if err != nil {
@@ -113,14 +131,38 @@ func (s *Server) useAlcoholDrink(ctx *Ctx) ([]byte, bool) {
 		return fail("饮品数量无效，请刷新背包")
 	}
 
-	if _, err := store.AdvanceDrinkBonusesTx(cctx, tx, uid, s.drinkRunKey(), time.Now(), s.drinkOnline(uid), s.drinkMaxGap()); err != nil {
-		return failed(err)
+	if isConsumable {
+		var satiety float64
+		switch qerr := tx.QueryRowContext(cctx,
+			`SELECT COALESCE(secondary_value,0) FROM player_condition WHERE uid=?`, uid).Scan(&satiety); {
+		case qerr == nil:
+			if satiety >= foodSatietyFullThreshold {
+				ctx.Sess.pushSystemChat("你已经吃饱了，吃不下更多食物")
+				return fail("你已经吃饱了")
+			}
+		case !errors.Is(qerr, sql.ErrNoRows):
+			return failed(qerr)
+		}
+	}
+
+	if isDrink {
+		if _, err := store.AdvanceDrinkBonusesTx(cctx, tx, uid, s.drinkRunKey(), time.Now(), s.drinkOnline(uid), s.drinkMaxGap()); err != nil {
+			return failed(err)
+		}
 	}
 	if _, err := consumeItemQtyTx(cctx, tx, row, 1); err != nil {
 		return failed(err)
 	}
-	if err := store.RefreshDrinkBonusTx(cctx, tx, uid, rule.Category, rule.Duration, row.GUID); err != nil {
-		return failed(err)
+	if isDrink {
+		if err := store.RefreshDrinkBonusTx(cctx, tx, uid, rule.Category, rule.Duration, row.GUID); err != nil {
+			return failed(err)
+		}
+	}
+	if isConsumable {
+		// 消耗品恢复：与扣物同事务，失败整体回滚。
+		if err := applyConsumableRestoreTx(cctx, tx, uid, restoreKind, cond, time.Now()); err != nil {
+			return failed(err)
+		}
 	}
 
 	var updated []*proto.Value
@@ -158,5 +200,9 @@ func (s *Server) useAlcoholDrink(ctx *Ctx) ([]byte, bool) {
 		change.Updated = []string{row.GUID}
 	}
 	ctx.AfterResponse(func() { ctx.Sess.pushBaitChange(change) })
+	if isConsumable {
+		// 恢复生效后立即补推一次 2/2，让对应状态条平滑回升。
+		ctx.AfterResponse(func() { pushKeepalive(ctx.Sess) })
+	}
 	return body, true
 }

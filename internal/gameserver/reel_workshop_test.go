@@ -32,6 +32,7 @@ func reelPartByCategory(t *testing.T, srv *Server, rowGUID string, category int6
 }
 
 func TestWorkshopExposesAllCompatibleReelParts(t *testing.T) {
+	t.Parallel()
 	srv, _ := newRigTestServer(t)
 	if n, _, err := srv.LoadCompatTable(); err != nil || n < 1000 {
 		t.Fatalf("兼容表未完整加载: alternatives=%d err=%v", n, err)
@@ -66,6 +67,7 @@ func TestWorkshopExposesAllCompatibleReelParts(t *testing.T) {
 }
 
 func TestWorkshopOrderRefreshesDragVersionAndPerformance(t *testing.T) {
+	t.Parallel()
 	srv, db := newRigTestServer(t)
 	ctx := context.Background()
 	const uid = int64(1000001)
@@ -129,7 +131,8 @@ func TestWorkshopOrderRefreshesDragVersionAndPerformance(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	wantLocked := 3.5 * 1.4 * reelBearingFactor(10)
+	_, gearQuality, gearDurability := srv.reelPartStateFromRow(ctx, fresh, reelPartCatGear)
+	wantLocked := 3.5 * reelLockMultiplier(1) * reelBearingFactor(10, 1) * reelGearFactor(gearQuality, gearDurability)
 	if math.Abs(perf.BaseDragKg-3.5) > 0.001 || math.Abs(perf.LockedDragKg-wantLocked) > 0.001 {
 		t.Fatalf("轮子物理参数=%+v，期望 base=3.5 locked=%f", perf, wantLocked)
 	}
@@ -137,13 +140,14 @@ func TestWorkshopOrderRefreshesDragVersionAndPerformance(t *testing.T) {
 		perf.OilItemID != "ef_reel_oil" || perf.OilQuality != 15 {
 		t.Fatalf("轴承/润滑油参数未写入物理表: %+v", perf)
 	}
-	if math.Abs(perf.CastFriction-reelCastFriction(10, 15, 1)) > 1e-9 ||
+	if math.Abs(perf.CastFriction-reelCastFriction(10, 1, 15, 1, 1)) > 1e-9 ||
 		math.Abs(perf.CastEfficiency-(1-perf.CastFriction)) > 1e-9 {
 		t.Fatalf("轮子抛投摩擦参数未随工坊零件刷新: %+v", perf)
 	}
 }
 
 func TestReelWorkshopStatsSurviveRelogTreeBuild(t *testing.T) {
+	t.Parallel()
 	srv, db := newRigTestServer(t)
 	ctx := context.Background()
 	const uid = int64(1000001)
@@ -222,6 +226,7 @@ func TestReelWorkshopStatsSurviveRelogTreeBuild(t *testing.T) {
 }
 
 func TestReelOverloadUsesDurabilityStages(t *testing.T) {
+	t.Parallel()
 	for durability, want := range map[float64]float64{
 		1.0: 1.4, 0.8: 1.3, 0.6: 1.2, 0.4: 1.1, 0.2: 1.0,
 	} {
@@ -230,9 +235,24 @@ func TestReelOverloadUsesDurabilityStages(t *testing.T) {
 		}
 	}
 	for quality, want := range map[float64]float64{0: 0.90, 10: 0.91, 75: 0.975, 100: 1.0} {
-		if got := reelBearingFactor(quality); math.Abs(got-want) > 1e-9 {
+		if got := reelBearingFactor(quality, 1); math.Abs(got-want) > 1e-9 {
 			t.Fatalf("轴承品质 %.0f 传力系数=%f，期望 %f", quality, got, want)
 		}
+	}
+	// 轴承自身磨旧：耐久从 1 掉到 0 最多再减 15%，换件能整段找回来。
+	for durability, want := range map[float64]float64{1: 1.0, 0.6: 0.94, 0.2: 0.88, 0: 0.85} {
+		if got := reelBearingFactor(100, durability); math.Abs(got-want) > 1e-9 {
+			t.Fatalf("轴承耐久 %.1f 传力系数=%f，期望 %f", durability, got, want)
+		}
+	}
+	// 齿轮效率：满品质满耐久不加成，磨完最多再减 10%。
+	for durability, want := range map[float64]float64{1: 1.0, 0.5: 0.95, 0: 0.90} {
+		if got := reelGearFactor(100, durability); math.Abs(got-want) > 1e-9 {
+			t.Fatalf("齿轮耐久 %.1f 传动系数=%f，期望 %f", durability, got, want)
+		}
+	}
+	if got := reelGearFactor(0, 1); math.Abs(got-0.95) > 1e-9 {
+		t.Fatalf("0 品质齿轮传动系数=%f，期望 0.95", got)
 	}
 	for quality, want := range map[float64]float64{15: 1.175, 70: 0.90, 100: 0.75} {
 		if got := reelOilWearFactor(quality); math.Abs(got-want) > 1e-9 {
@@ -259,63 +279,34 @@ func TestReelOverloadUsesDurabilityStages(t *testing.T) {
 	mountGearForTest(t, srv, sess, rod.GUID, reel.GUID)
 	mountGearForTest(t, srv, sess, rod.GUID, line.GUID)
 
-	// —— 锁轮超载（默认 30 档）：锁轮装置拉力参与损坏计算 ——
-	decision, err := srv.resolveGearBreak(ctx, uid, rod.GUID, line.GUID)
+	// —— 客户端已上报锁轮（线上 29 / UI 30）：锁轮承力参与最弱环比较 ——
+	if err := db.UpsertRodSetting(ctx, rod.GUID, reelDragSettingKey, "29"); err != nil {
+		t.Fatal(err)
+	}
+	decision, err := srv.resolveGearBreak(ctx, uid, rod.GUID, reel.GUID)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if decision.Part != "reel" || decision.ReelSlip {
-		t.Fatalf("锁轮承力最弱时应判锁轮超载(ReelSlip=false): %+v", decision)
+		t.Fatalf("锁轮承力最弱时应判渔轮损坏(ReelSlip=false): %+v", decision)
 	}
-	lockOutcome, err := srv.breakLineOrRod(ctx, uid, rod.GUID, line.GUID)
+	lockOutcome, err := srv.breakLineOrRod(ctx, uid, rod.GUID, reel.GUID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !lockOutcome.ReelDamaged || lockOutcome.FrictionWorn || lockOutcome.LineBroken {
-		t.Fatalf("锁轮超载结果错误: %+v", lockOutcome)
+	if !lockOutcome.ReelDamaged || !lockOutcome.ReelBroken || lockOutcome.FrictionWorn || lockOutcome.LineBroken {
+		t.Fatalf("上报渔轮损坏结果错误: %+v", lockOutcome)
 	}
 	lockFresh, _ := db.GetItemByGUID(ctx, reel.GUID)
-	if math.Abs(lockFresh.Durability-0.8) > 1e-9 {
-		t.Fatalf("锁轮超载应掉一个耐久档，耐久=%f 期望 0.8", lockFresh.Durability)
-	}
-
-	// —— 低档位泄力打滑（1 档）：磨摩擦片，本体耐久不动 ——
-	if err := db.UpsertRodSetting(ctx, rod.GUID, reelDragSettingKey, "1"); err != nil {
-		t.Fatal(err)
-	}
-	reelBefore, _ := db.GetItemByGUID(ctx, reel.GUID)
-	perfBefore, _ := srv.syncReelPerformance(ctx, reelBefore)
-	decision, err = srv.resolveGearBreak(ctx, uid, rod.GUID, line.GUID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if decision.Part != "reel" || !decision.ReelSlip {
-		t.Fatalf("低档位泄力打滑应判 ReelSlip=true: %+v", decision)
-	}
-	outcome, err := srv.breakLineOrRod(ctx, uid, rod.GUID, line.GUID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !outcome.ReelDamaged || outcome.ReelBroken || outcome.LineBroken {
-		t.Fatalf("泄力打滑结果错误: %+v", outcome)
-	}
-	fresh, _ := db.GetItemByGUID(ctx, reel.GUID)
-	// 打滑磨的是摩擦片制动力，本体耐久不掉（仍为锁轮超载后的 0.8）。
-	if math.Abs(fresh.Durability-0.8) > 1e-9 {
-		t.Fatalf("泄力打滑不应再伤本体，耐久=%f 期望 0.8", fresh.Durability)
-	}
-	perfAfter, _ := srv.syncReelPerformance(ctx, fresh)
-	if !(perfAfter.BaseDragKg < perfBefore.BaseDragKg*(1-1e-9)) {
-		t.Fatalf("打滑应磨摩擦片制动力：before=%v after=%v", perfBefore.BaseDragKg, perfAfter.BaseDragKg)
-	}
-	if got, _ := db.GetItemByGUID(ctx, reel.GUID); got == nil {
-		t.Fatal("泄力打滑只磨摩擦片，不应从钓组删除轮子")
+	if lockFresh.Durability != 0 {
+		t.Fatalf("渔轮损坏后耐久应直接归 0，实得 %f", lockFresh.Durability)
 	}
 }
 
 // TestReelSlipDegradesFrictionWasherByStep 验证单次泄力打滑让摩擦片制动力
 // 按 reelSlipWear 比例衰减，且与轮油无关（摩擦片发热磨损，油润滑齿轮不润滑摩擦片）。
 func TestReelSlipDegradesFrictionWasherByStep(t *testing.T) {
+	t.Parallel()
 	srv, db := newRigTestServer(t)
 	ctx := context.Background()
 	const uid = int64(1000001)
@@ -331,8 +322,10 @@ func TestReelSlipDegradesFrictionWasherByStep(t *testing.T) {
 		t.Fatal(err)
 	}
 	fresh, _ := db.GetItemByGUID(ctx, reel.GUID)
-	if math.Abs(fresh.Durability-1.0) > 1e-9 {
-		t.Fatalf("首次打滑轮子耐久=%f，期望仍为1.0（磨摩擦片不是本体）", fresh.Durability)
+	// 本体那一格是零件综合：磨掉 0.5% 摩擦片，外面最多随它的权重降 0.125%，
+	// 不会把本体一次性打掉；但它确实会动，不再是“磨件不伤本体”。
+	if fresh.Durability >= 1 || fresh.Durability < 1-reelBodyWeightWasher*reelSlipWear-1e-9 {
+		t.Fatalf("首次打滑后本体耐久=%f，应只随摩擦片权重微降", fresh.Durability)
 	}
 	after, perr := srv.syncReelPerformance(ctx, fresh)
 	if perr != nil {
@@ -345,6 +338,7 @@ func TestReelSlipDegradesFrictionWasherByStep(t *testing.T) {
 }
 
 func TestHandRodIgnoresBackpackReel(t *testing.T) {
+	t.Parallel()
 	srv, _ := newRigTestServer(t)
 	ctx := context.Background()
 	const uid = int64(1000001)

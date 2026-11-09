@@ -516,18 +516,18 @@ func (s *Session) pushChatRaw(variant, kind int, text string) {
 // fishTVKv 构造 401.f4 的鱼名和重量参数。
 // 容器为 [0x03][1B len "135"][u16 count][元素...]，类型名是 wiregen typeid
 // 400 的十进制字符串 "135"；元素带 typed 对象头 [0x01][u32le 400]。
-// 键1 = 鱼种文本（0x14 短字符串）、键2 = 重量（0x0D u32，客户端按
-// /1000f 转千克）。客户端 4.0.25034 实机验证可渲染且连接稳定。
-func fishTVKv(fishKey string, weightG int64) *proto.Value {
-	if fishKey == "" {
-		fishKey = "g_tench"
+// 键1 = 展示文本（0x14 短字符串，中文鱼名）、键2 = 重量（0x0D u32，
+// 客户端按克/公斤显示）。客户端 4.0.25034 实机验证可渲染且连接稳定。
+func fishTVKv(text string, weightG int64) *proto.Value {
+	if text == "" {
+		text = "g_tench"
 	}
 	if weightG < 0 {
 		weightG = 0
 	}
 	head := append([]byte{}, fishKVElem(1, 0, true)[:5]...) // [0x01][u32le 400] typed 头
-	k1 := append(head, 0x01, 0x14, byte(len(fishKey)))
-	k1 = append(k1, fishKey...)
+	k1 := append(head, 0x01, 0x14, byte(len(text)))
+	k1 = append(k1, text...)
 	k2 := fishKVElem(2, uint32(weightG), true)
 	return fishKVRaw(fishKVArr("135", 2, k1, k2))
 }
@@ -785,8 +785,9 @@ func hSocialPublic(ctx *Ctx) ([]byte, bool) {
 //	0 背包    1/6 帐篷    2/7 汽车    3/8 船
 //	4/9 摩托车   5 鱼护    10/11 房屋
 //
-// 未知枚举回退到背包。4/1、4/4、4/5 只有背包和鱼护包含物品；其他容器必须
-// 返回空，避免同一 GUID 被客户端登记到多个容器后发生索引冲突。
+// 未知枚举回退到背包。4/1、4/4、4/5 只对背包、鱼护、房屋和卡册等拥有
+// 实际物品列表的容器返回数据；其他容器必须返回空，避免同一 GUID 被
+// 客户端登记到多个容器后发生索引冲突。
 func containerEnumName(v uint64) string {
 	switch v {
 	case 0:

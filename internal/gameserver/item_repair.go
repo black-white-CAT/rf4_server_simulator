@@ -12,7 +12,7 @@ import (
 // itemPhysicsRepairKey 记录最近一次物理字段修复的版本与统计。
 // 每次启动仍会重新扫描，以修复后续导入或回档产生的异常数据。
 const itemPhysicsRepairKey = "repair:item_physics:v5"
-const itemPhysicsRepairVersion = "10"
+const itemPhysicsRepairVersion = "11"
 
 const craftedLeaderQuarantineContainer = "craft_quarantine"
 
@@ -101,7 +101,7 @@ func (s *Server) migrateLegacyZeroDragForce(ctx context.Context) (int, error) {
 //   - 回填零值状态位和容器枚举；
 //   - 修正渔轮刹车片成色，只补齐缺失的曳力字段（已有磨损值不再覆盖）；
 //   - 将竿的 f5 类型限制在竿型允许范围内；
-//   - 把自制引线的普通主线子对象换成对应的前导线定义。
+//   - 修复旧自制引线的内嵌线材槽位，并把旧减震引线迁到 f3。
 //
 // 兼容性只用于装配推荐，不覆盖玩家显式选择。修复写回 fields_json，
 // 并通过 ensureRig 同步 rig/rig_component。成功后写版本和统计标记；
@@ -228,6 +228,13 @@ func (s *Server) RepairItemPhysics(ctx context.Context) error {
 				if _, avail := rigBaitMountsOf(fields[idx].Val); avail == 0 {
 					setRigBaitMountAvail(fields[idx].Val, baitMountAvailForRig(s.rigTypeOfItem(ctx, it), 0))
 				}
+			}
+		}
+		// 品类 46（成品窝料）存量补单件克重：老实例是照抄定义生成的，
+		// 重量恒为 0，卡片永远显示「质量 0 克」。
+		if def46, derr := s.DB.GetItemDef(ctx, it.NumericID); derr == nil && def46 != nil && def46.Category == 46 {
+			if fillFeedUnitWeight(it.WireClass, fields, def46.ItemID) {
+				rowChanged = true
 			}
 		}
 		if s.canonicalizeItemPhysicalFields(ctx, it, fields) {

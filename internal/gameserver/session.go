@@ -209,6 +209,10 @@ func (s *Server) nextCallID(token string) uint64 {
 // 客户端根据 2/2 推算世界日号，长时间无下行会断开连接。
 func (s *Session) startKeepalive() {
 	s.updateDrinkBonuses(time.Now())
+	s.advanceGroundbaitClock()
+	// 状态条在线钟：登录/重连时冻结离线跨度（饱食度停扣、精力停恢复），
+	// 会话期间由每拍 pushKeepalive 的读路径按时间差推进。
+	s.Srv.resumePlayerConditionClock(s.pushCtx(), s.Userid)
 	interval := s.Srv.cfg.KeepaliveInterval()
 	go func() {
 		timer := time.NewTimer(500 * time.Millisecond)
@@ -224,6 +228,7 @@ func (s *Session) startKeepalive() {
 				s.updateHappyHour(time.Now(), false)
 				pushKeepalive(s)
 				s.updateDrinkBonuses(time.Now())
+				s.advanceGroundbaitClock()
 				// 钓鱼游在线计时：每拍扣减，到期回收 place_access 后推档案，
 				// 客户端 f23 徽章随之消失（目的地重新上锁）。
 				if s.consumeTripTimes(time.Now()) {

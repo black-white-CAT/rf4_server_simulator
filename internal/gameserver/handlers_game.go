@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"strings"
 	"time"
 
 	"rf4server/internal/proto"
@@ -39,9 +40,10 @@ func hProfile(ctx *Ctx) ([]byte, bool) {
 
 // 客户端库存枚举。
 const (
-	containerBackpack     = 0
-	containerKeepnet      = 5
-	containerTradingCards = 18
+	containerBackpack      = 0
+	containerKeepnet       = 5
+	containerTradingCards  = 18
+	houseContainerCapacity = 100
 )
 
 // ---- 4/1 items/count ----
@@ -64,6 +66,11 @@ func hItemCount(ctx *Ctx) ([]byte, bool) {
 			used = int64(len(n))
 		}
 		cap, capMember = 100, 150
+	case 10, 11:
+		// 房屋仓库：容量按 100 起步。回 0 时客户端认为仓库容量为零，
+		// 存放交互在 UI 层就被拦下。
+		used, _ = srv.DB.CountItemsByContainers(cctx, ctx.Sess.Userid, []string{"house"})
+		cap = houseContainerCapacity
 	default:
 		if names := nativeInventoryContainers(container); names != nil {
 			used, _ = srv.DB.CountItemsByContainers(cctx, ctx.Sess.Userid, names)
@@ -612,10 +619,12 @@ func hEnterMap(ctx *Ctx) ([]byte, bool) {
 	if scene == "" {
 		scene = sceneForLevel(level)
 	}
-	// 钓鱼游/买断已失效的付费地图不能作为出生地图（钓鱼游到期即失去
-	// 进入资格），回退出生地图，避免到期后重连仍留在原地图。
-	if srv.tripLevelLocked(sess.pushCtx(), uid, level) {
-		ctx.Log.Info("1/13 目标地图无有效钓鱼游，回出生地图", "level", level)
+	// 空请求只恢复上次位置；银币票停留没有 access 记录，不能直接用
+	// tripLevelLocked 判断。只有上次地图明确依赖已到期钓鱼游且之后没有
+	// 新银币票流水时才回出生图。带 key 的真正进入交给 settleTravel：
+	// 买断/有效钓鱼游/房屋免票，否则扣银币门票。
+	if !charge && srv.loginRestoreTripExpired(sess.pushCtx(), uid, level) {
+		ctx.Log.Info("1/13 上次地图钓鱼游已到期，回出生地图", "level", level)
 		level, scene, spot = spawnLevelKey, sceneForLevel(spawnLevelKey), 0
 	}
 
@@ -690,33 +699,36 @@ func hSetQuivertip(ctx *Ctx) ([]byte, bool) {
 		return nil, false // 交给兜底
 	}
 	cctx := ctx.Sess.pushCtx()
+	row := srv.ownedRodRow(cctx, ctx.Sess.Userid, rodGUID)
+	if row == nil {
+		ctx.Log.Warn("17/5 竿不属于当前玩家，已忽略", "竿", shortGUID(rodGUID))
+		return nil, true
+	}
 	_ = srv.DB.UpsertRodSetting(cctx, rodGUID, "quivertip", tip)
-	if row, err := srv.DB.GetItemByGUID(cctx, rodGUID); err == nil && row != nil {
-		if fields, ferr := FieldsFromJSON(row.FieldsJSON); ferr == nil {
-			tidx := fieldIdxByCS(row.WireClass, "kjphlnnlflh")
-			if tidx >= 0 {
-				for len(fields) <= tidx {
-					zf, zerr := proto.ZeroField(fieldOpAt(row.WireClass, len(fields)))
-					if zerr != nil {
-						break
-					}
-					fields = append(fields, zf)
+	if fields, ferr := FieldsFromJSON(row.FieldsJSON); ferr == nil {
+		tidx := fieldIdxByCS(row.WireClass, "kjphlnnlflh")
+		if tidx >= 0 {
+			for len(fields) <= tidx {
+				zf, zerr := proto.ZeroField(fieldOpAt(row.WireClass, len(fields)))
+				if zerr != nil {
+					break
 				}
-				fields[tidx].Str = &tip
-				// 落库时将 U32N 的字符串值写成 STR 标签；
-				// fields_json 读取侧会丢弃 u32n 标签下的字符串。
-				fields[tidx].Op = "STR"
-				if fj, jerr := FieldsToJSON(fields); jerr == nil {
-					_ = srv.DB.UpdateItemFields(cctx, row.GUID, fj, row.Qty, row.Durability, row.Workmanship, row.RigGUID)
-				}
+				fields = append(fields, zf)
+			}
+			fields[tidx].Str = &tip
+			// 兼容旧版把 U32N 的字符串值写进 STR 标签；
+			// fields_json 读取会丢失 u32n 标签下的字符串。
+			fields[tidx].Op = "STR"
+			if fj, jerr := FieldsToJSON(fields); jerr == nil {
+				_ = srv.DB.UpdateItemFields(cctx, row.GUID, fj, row.Qty, row.Durability, row.Workmanship, row.RigGUID)
 			}
 		}
-		// 响应 800：Field 1（更新段）= 带新尖梢的竿实例
-		if tree, terr := srv.ItemToTree(cctx, row); terr == nil {
-			body, encErr := proto.EncodeValue(build800(proto.Null(), proto.Args(proto.S("61"), tree), proto.Null()), ctx.Sess.Table())
-			if encErr == nil {
-				return body, true
-			}
+	}
+	// 响应 800，Field 1（更新段）= 刚更新的竿实例。
+	if tree, terr := srv.ItemToTree(cctx, row); terr == nil {
+		body, encErr := proto.EncodeValue(build800(proto.Null(), proto.Args(proto.S("61"), tree), proto.Null()), ctx.Sess.Table())
+		if encErr == nil {
+			return body, true
 		}
 	}
 	return nil, false
@@ -768,12 +780,15 @@ func hCastPrepare(ctx *Ctx) ([]byte, bool) {
 		return nil, true
 	}
 	st = srv.selectFishingRod(ctx.Sess.Userid, gear)
-	reelSetting, hasReelSetting := srv.rodReelDragSetting(ctx.Sess.pushCtx(), gear)
+	// 未保存过 17/15 时按新竿 f5.f7 的默认值处理，避免客户端显示 15、
+	// 服务端判鱼却按 0（无 trolling 加成）导致状态不一致。
+	reelSpeed := defaultReelSpeed
+	if saved, ok := srv.rodReelSpeedSetting(ctx.Sess.pushCtx(), gear); ok {
+		reelSpeed = saved
+	}
 	st.mu.Lock()
 	st.GearGuid = gear
-	if hasReelSetting {
-		st.ReelSetting = reelSetting
-	}
+	st.ReelSetting = reelSpeed
 	if rigTypeLureFamily[st.RigType] {
 		st.LureMotionMask = 0
 		st.LureAction = ""
@@ -882,11 +897,7 @@ func hCast(ctx *Ctx) ([]byte, bool) {
 	st.GearGuid = gear
 	st.CastPosX, st.CastPosZ, st.HasCastPos = castX, castZ, hasCastPos
 	st.mu.Unlock()
-	if err := ctx.Sess.prepareBaitForCast(st, gear); err != nil {
-		ctx.Log.Warn("抛竿前补饵失败", "err", err)
-		return nil, false
-	}
-	srv.ensureRig(ctx.Sess.pushCtx(), ctx.Sess.Userid, gear)
+
 	// 记录钓组类型并读取当前钩上饵；路亚使用独立的咬钩节奏。
 	rigType := int64(0)
 	if row, err := srv.DB.GetItemByGUID(ctx.Sess.pushCtx(), gear); err == nil && row != nil {
@@ -923,6 +934,20 @@ func hCast(ctx *Ctx) ([]byte, bool) {
 		ctx.ReplyFailure("System.InvalidOperationException", "渔线轮已损坏，请先修理")
 		return nil, true
 	}
+	// 精力闸门：低于阈值拒绝抛投。官服结果码 84 = kOperationResult_LowEnergyLevel，
+	// 形状与上面 136 WrongRegion 拒绝一致，客户端弹 kOperationResult_* 文案。
+	if !srv.conditionAllowsCast(ctx.Sess.pushCtx(), ctx.Sess.Userid) {
+		ctx.Log.Info("14/2 被拒：精力不足")
+		ctx.ReplyOperationResult(operationResultLowEnergyLevel)
+		return nil, true
+	}
+	// 补饵/ensureRig 会写库并推送背包状态，必须在精力闸门放行后执行；
+	// 否则一次低精力拒绝也会产生可见的钓组/背包副作用。
+	if err := ctx.Sess.prepareBaitForCast(st, gear); err != nil {
+		ctx.Log.Warn("抛竿前补饵失败", "err", err)
+		return nil, false
+	}
+	srv.ensureRig(ctx.Sess.pushCtx(), ctx.Sess.Userid, gear)
 	// 14/1 给出的是满力度上限；14/2 才携带本次实际落点、动作和出手力度。
 	// 这里只做真实请求诊断，不能把本杆力度写回下一杆的上限。
 	requestedM := throwDistance(ctx.Tree)
@@ -941,6 +966,9 @@ func hCast(ctx *Ctx) ([]byte, bool) {
 	bait := srv.currentBait(ctx.Sess.pushCtx(), gear)
 	st.mu.Lock()
 	st.Bait = bait
+	// 实际落点距离供后续咬钩快照给资格判定；不能用 castProf.DistanceM
+	//（钓具理论最大距离），否则 5m 短抛也会满足「抛投 ≥30m」。
+	st.CastM = requestedM
 	st.mu.Unlock()
 	// 水体距离闸门：玩家离水体太远（抛投够不到）时不派鱼。
 	// 只有该地点有水体矩形数据时才判定；没有数据一律放行，避免误伤。
@@ -965,6 +993,8 @@ func hCast(ctx *Ctx) ([]byte, bool) {
 			return nil, true
 		}
 	}
+	// 抛投已受理（含够不到水面的空杆）：扣本次抛投精力，动作写入总是落库。
+	srv.spendEnergy(ctx.Sess.pushCtx(), ctx.Sess.Userid, srv.conditionParams().CastEnergyCost)
 
 	// 响应 800.f0 返回当前钓组 157 对象，包含完整竿树和重建后的 f5。
 	cctx := ctx.Sess.pushCtx()
@@ -976,6 +1006,8 @@ func hCast(ctx *Ctx) ([]byte, bool) {
 	if err != nil {
 		return nil, false
 	}
+	// 抛投事件交给成就规则判断一次；2/8 弹窗排在 800 应答之后。
+	srv.evaluateAchievements(ctx, achievementEvent{Kind: evCast, DistanceM: requestedM})
 	return body, true
 }
 
@@ -1159,32 +1191,70 @@ func hFishingStep(ctx *Ctx) ([]byte, bool) {
 }
 
 func hFishingFall(ctx *Ctx) ([]byte, bool) {
-	st := ctx.Sess.Srv.fishingStateForRequest(ctx)
+	srv := ctx.Sess.Srv
+	st := srv.fishingStateForRequest(ctx)
 	st.mu.Lock()
 	st.FallSeen = true
 	st.FallTs = time.Now()
+	rigType, gear := st.RigType, st.GearGuid
 	st.mu.Unlock()
+	// 打窝器入水就把料倒进落点：它不发 14/7，14/3 就是它的入水信号。
+	// 幂等键沿用本次抛竿，客户端重复上报不会重复扣份。
+	if spodRigTypes[rigType] {
+		if err := srv.consumeCastBait(ctx.Sess, st); err != nil {
+			ctx.Log.Warn("打窝器入窝料扣减失败", "rod", shortGUID(gear), "err", err)
+		}
+	}
 	return nil, true
 }
 
 func hFishingPull(ctx *Ctx) ([]byte, bool) {
 	// 14/9 fishing/pull：纺车杆的"抬杆"（右键）与"小刺"（Ctrl+右键）。
 	// 客户端在本地播放杆梢动作，这条命令是 fire-and-forget 通知，不需要回包。
-	// 海钓使用 Pull 作为实际刺鱼入口，不一定另发普通钓法的 14/11；收到鱼后若只记录
-	// 这条命令，客户端永远得不到 14/15 挂钩确认，表现为不能抬竿且没有力度条。
+	// 海钓使用 Pull 作为实际刺鱼入口，不一定另发普通钓法的 14/11。
+	// ⚠️ 下面的 marineHookConfirm 分支推送的 14/15 实为"鱼离场"（见 fishing.go
+	// Push14_15 注释），开启 marine_hook_confirm 会把刚上钩的海钓鱼直接放走，
+	// 保持默认关闭。
 	srv := ctx.Sess.Srv
+	// 搏鱼抬杆/小刺扣精力：14/9 无官服拒绝样本，只扣不拒（搏鱼中拒绝会破坏
+	// 鱼战状态一致性）；精力闸门只在 14/2 抛投入口生效。
+	srv.spendEnergy(ctx.Sess.pushCtx(), ctx.Sess.Userid, srv.conditionParams().PullEnergyCost)
 	st := srv.fishingStateForRequest(ctx)
 	st.mu.Lock()
+	wasHooked := st.Hooked
 	pending, gear, rigType := st.Pending, st.GearGuid, st.RigType
+	castActive, resolved := st.CastActive, st.Resolved
 	if rigTypeLureFamily[rigType] {
 		st.recordLurePulseLocked(time.Now())
 	}
-	confirm := marineRigType(rigType) && pending != nil && st.CastActive && !st.Resolved && !st.Hooked
-	if confirm {
+	needsConfirmation := marineRigType(rigType) && pending != nil && castActive && !resolved && !pending.HookConfirmed
+	reconfirm := marineRigType(rigType) && pending != nil && pending.HookConfirmed && !wasHooked && castActive && !resolved
+	nibble := false
+	if needsConfirmation {
+		nibble = !pending.LuckProtected && pending.BiteQuality == "nibble"
+		if !wasHooked && !nibble {
+			nibble = hookRetentionFails(pending)
+		}
+		if !nibble {
+			st.Hooked = true
+			pending.HookConfirmed = true
+		}
+	} else if reconfirm {
 		st.Hooked = true
 	}
+	var hookedFish RolledFish
+	var announce bool
+	if needsConfirmation && !nibble {
+		hookedFish, announce = st.takeHookedChatFishLocked()
+	}
 	st.mu.Unlock()
-	if confirm {
+	if needsConfirmation && nibble {
+		finishNibbleHook(ctx, st, pending, gear, castActive, resolved)
+		ctx.Log.Info("14/9 海钓嘬饵未中钩，重新排鱼", "rod", shortGUID(gear),
+			"fish", shortGUID(pending.FishGUID), "species", pending.Species)
+		return nil, true
+	}
+	if needsConfirmation {
 		if err := srv.consumeHookedBait(ctx.Sess, pending, gear); err != nil {
 			ctx.Log.Warn("海钓抬竿后鱼饵扣减失败", "fish", pending.FishGUID, "err", err)
 		}
@@ -1199,8 +1269,14 @@ func hFishingPull(ctx *Ctx) ([]byte, bool) {
 		}
 		ctx.Log.Info("14/9 海钓抬竿确认", "rod", shortGUID(gear), "fish", shortGUID(pending.FishGUID),
 			"rig_type", rigType, "14/15", bound)
+	} else if reconfirm {
+		ctx.Log.Info("14/9 重复确认已中钩鱼，幂等恢复 Hooked", "rod", shortGUID(gear),
+			"fish", shortGUID(pending.FishGUID))
 	} else {
 		ctx.Log.Info("14/9 抬杆/小刺", "len", len(ctx.Body), "hex", traceHexHead(ctx.Body, 96), "rig_type", rigType)
+	}
+	if announce {
+		srv.notifyFishHooked(ctx.Sess, hookedFish, gear)
 	}
 	return nil, true
 }
@@ -1210,18 +1286,49 @@ func hFishingHooked(ctx *Ctx) ([]byte, bool) {
 	st := srv.fishingStateForRequest(ctx)
 	st.mu.Lock()
 	wasHooked := st.Hooked
-	st.Hooked = true
 	pending := st.Pending
 	gear := st.GearGuid
 	rigType := st.RigType
 	castActive := st.CastActive
 	resolved := st.Resolved
+	if pending != nil && pending.HookConfirmed {
+		if !wasHooked {
+			st.Hooked = true
+		}
+		hookedFish, announce := st.takeHookedChatFishLocked()
+		st.mu.Unlock()
+		if announce {
+			srv.notifyFishHooked(ctx.Sess, hookedFish, gear)
+		}
+		ctx.Log.Info("14/11 重复中钩确认，幂等恢复", "rod", shortGUID(gear),
+			"fish", shortGUID(pending.FishGUID), "species", pending.Species)
+		return nil, true
+	}
+	// 钩型保持率只在首次中钩确认时抽样一次；已经 Hooked 的早期确认
+	// 或登录恢复不再重抽，但仍需为这尾鱼记录一次确认完成。
+	nibble := pending != nil && !pending.LuckProtected && pending.BiteQuality == "nibble"
+	if pending != nil && !wasHooked && !nibble && hookRetentionFails(pending) {
+		pending.BiteQuality = "nibble"
+		nibble = true
+	}
+	if !nibble {
+		st.Hooked = true
+		if pending != nil {
+			pending.HookConfirmed = true
+		}
+	}
+	hookedFish, announce := st.takeHookedChatFishLocked()
 	st.mu.Unlock()
 	fishGUID, species := "", ""
 	if pending != nil {
 		fishGUID, species = pending.FishGUID, pending.Species
 	}
 	ctx.Log.Info("14/11 中鱼", "rod", shortGUID(gear), "fish", shortGUID(fishGUID), "species", species, "was_hooked", wasHooked)
+	if nibble {
+		finishNibbleHook(ctx, st, pending, gear, castActive, resolved)
+		ctx.Log.Info("14/11 嘬饵未中钩，重新排鱼", "fish", shortGUID(fishGUID), "species", species)
+		return nil, true
+	}
 	if pending != nil {
 		if err := srv.consumeHookedBait(ctx.Sess, pending, gear); err != nil {
 			ctx.Log.Warn("中鱼后鱼饵扣减失败", "fish", pending.FishGUID, "err", err)
@@ -1247,7 +1354,43 @@ func hFishingHooked(ctx *Ctx) ([]byte, bool) {
 	} else {
 		ctx.Sess.Push4_22Hook(gear)
 	}
+	if announce {
+		srv.notifyFishHooked(ctx.Sess, hookedFish, gear)
+	}
 	return nil, true
+}
+
+// finishNibbleHook 统一普通与海钓的嘬饵失败收尾：轻耗一份饵，
+// 清掉本轮鱼实体并重新跑一次咬口调度。
+func finishNibbleHook(ctx *Ctx, st *FishState, pending *RolledFish, gear string, castActive, resolved bool) {
+	srv := ctx.Sess.Srv
+	if pending != nil {
+		pending.HookConfirmed = false
+		if err := srv.consumeNibbleBait(ctx.Sess, pending, gear); err != nil {
+			ctx.Log.Warn("嘬饵扣饵失败", "fish", pending.FishGUID, "err", err)
+		}
+		// 14/11 的客户端语义是"鱼实体已进搏鱼态"，服务端单方面否决必须让客户端
+		// 知情：推送鱼离场（14/15 = 鱼离场分支，args[1]=鱼 GUID），
+		// 客户端走与自然脱钩相同的离场状态机放鱼游走，否则它会一直搏到岸边凭空消失。
+		// 客户端尚未接受鱼实体（此前 f0=3/5 拒收）时这是一次无效查找，无副作用。
+		if bound := ctx.Sess.Push14_15(gear, pending.FishGUID); bound {
+			ctx.Log.Info("嘬饵否决推送鱼离场 14/15", "fish", shortGUID(pending.FishGUID),
+				"species", pending.Species)
+		}
+	}
+	st.mu.Lock()
+	if st.Pending == pending {
+		st.Pending = nil
+		st.PushSent = false
+		st.Hooked = false
+		st.Resolved = false
+		st.PendingRepush = 0
+		st.LuckRepush = 0
+	}
+	st.mu.Unlock()
+	if castActive && !resolved {
+		srv.scheduleBiteState(ctx.Sess, st, false, false)
+	}
 }
 
 func hFishingLeft(ctx *Ctx) ([]byte, bool) {
@@ -1267,6 +1410,26 @@ func hFishingLeft(ctx *Ctx) ([]byte, bool) {
 	}
 	st.mu.Lock()
 	ctx.Log.Info("14/12 鱼状态", "rod", shortGUID(st.GearGuid), "f0", f0, "hooked", st.Hooked)
+	// 14/12 顶层 args 为 [竿 GUID, 鱼 GUID, 状态对象]（实机 TRACE 与 14/14
+	// 推送核对）。鱼 GUID 与当前 Pending 不一致的是陈旧/异常帧：它描述的是
+	// 别的鱼，不得影响正在搏斗或待入护的这条。
+	reported := ""
+	if guids := deepGUIDs(ctx.Tree); len(guids) >= 2 {
+		reported = guids[1]
+	}
+	if st.Pending != nil && reported != "" && !strings.EqualFold(reported, st.Pending.FishGUID) {
+		ctx.Log.Info("14/12 忽略不一致的鱼 GUID", "f0", f0,
+			"reported", shortGUID(reported), "pending", shortGUID(st.Pending.FishGUID))
+		st.mu.Unlock()
+		return nil, true
+	}
+	if completedCatchPending(st) {
+		// 14/4 已结算、等待 14/5 入护 / 14/6 放生：经验已落账，任何迟到的
+		// 状态上报不得清掉这尾鱼，否则结算无处安放（幽灵鱼）。
+		ctx.Log.Info("14/12 已结算渔获等待处理，忽略状态上报", "f0", f0)
+		st.mu.Unlock()
+		return nil, true
+	}
 	if f0 == 6 {
 		st.cancelPendingTimerLocked()
 		st.PushSent = true
@@ -1276,6 +1439,15 @@ func hFishingLeft(ctx *Ctx) ([]byte, bool) {
 	if f0 == 3 || f0 == 5 {
 		// 客户端尚未接收鱼实体：保留当前鱼，延迟重推同一尾，
 		// 不能把不兼容的钓组状态误当成鱼已离场。
+		//
+		// 例外：Pending 为空时这是一条离场回执（典型：嘬饵否决推送 14/15 后
+		// 客户端放鱼游走的 f0=5）。此时本竿刚重排完，绝不能走下面的拒收路径——
+		// 它会 cancel 刚 armed 的咬钩 timer 并把 Resolved 置真，整竿就此哑火。
+		if st.Pending == nil {
+			st.mu.Unlock()
+			ctx.Log.Info("14/12 无在途鱼，按离场回执忽略", "f0", f0, "reported", shortGUID(reported))
+			return nil, true
+		}
 		st.cancelBiteTimerLocked()
 		st.PushSent = false
 		st.Hooked = false
@@ -1290,6 +1462,18 @@ func hFishingLeft(ctx *Ctx) ([]byte, bool) {
 			st.PendingRepush = 0
 			st.Resolved = true
 		}
+		st.mu.Unlock()
+		return nil, true
+	}
+	if (f0 == 1 || f0 == 2 || f0 == 8) && st.Hooked &&
+		st.Pending != nil && st.Pending.LuckProtected && st.LuckRepush < 2 {
+		st.LuckRepush++
+		st.Hooked = false
+		st.PushSent = false
+		st.PendingRepush = 0
+		srv.armPendingTimerLocked(ctx.Sess.Userid, st, 2*time.Second)
+		ctx.Log.Info("蓝冠天命保护：忽略钩型脱钩并重推", "f0", f0,
+			"fish", shortGUID(st.Pending.FishGUID), "retry", st.LuckRepush)
 		st.mu.Unlock()
 		return nil, true
 	}
@@ -1318,14 +1502,18 @@ func hFishingLeft(ctx *Ctx) ([]byte, bool) {
 		st.Resolved = false
 		castActive := st.CastActive
 		inWater := st.InWater
+		loc, spot := st.Loc, st.Spot
 		st.mu.Unlock()
 		if hooked && !alreadyResolved {
 			srv.bumpFishingCounter(ctx.Sess.Userid, "escapes")
+			srv.recordHuntEscape(ctx.Sess.pushCtx(), ctx.Sess.Userid, loc, spot, pending)
 			srv.notifyFishEscape(ctx.Sess, pending, "脱钩离开")
 			ctx.Log.Info("14/12 已中鱼跑鱼，按真脱钩播报", "f0", f0)
 		} else {
 			ctx.Log.Info("14/12 鱼未上钩离场，官方静默", "f0", f0, "hooked", hooked)
 		}
+		// 这一尾鱼的渔轮账到此为止，先落库再排下一尾。
+		srv.settleFightReelWearState(srv.dbCtx(), st, ctx.Sess.Userid, "14/12")
 		if castActive && inWater {
 			srv.scheduleBiteState(ctx.Sess, st, false, false)
 		}
@@ -1335,13 +1523,23 @@ func hFishingLeft(ctx *Ctx) ([]byte, bool) {
 	st.cancelPendingTimerLocked()
 	pending := st.Pending
 	alreadyResolved := st.Resolved
+	hooked := st.Hooked
+	loc, spot := st.Loc, st.Spot
 	st.Resolved = true
 	st.Pending = nil
+	st.Hooked = false
+	st.PushSent = false
 	st.CastActive = false
 	st.mu.Unlock()
-	srv.bumpFishingCounter(ctx.Sess.Userid, "escapes")
-	if !alreadyResolved {
+	// 脱钩同样是这一竿的终局：渔轮发热账当场落库。
+	srv.settleFightReelWearState(srv.dbCtx(), st, ctx.Sess.Userid, "14/12")
+	if hooked && pending != nil && !alreadyResolved {
+		srv.bumpFishingCounter(ctx.Sess.Userid, "escapes")
+		srv.recordHuntEscape(ctx.Sess.pushCtx(), ctx.Sess.Userid, loc, spot, pending)
 		srv.notifyFishEscape(ctx.Sess, pending, "脱钩离开")
+		ctx.Log.Info("14/12 未知帧已中鱼跑鱼，按真脱钩播报", "f0", f0)
+	} else {
+		ctx.Log.Info("14/12 未知帧鱼未上钩，不记脱钩补偿", "f0", f0, "hooked", hooked)
 	}
 	return nil, true
 }
@@ -1353,6 +1551,8 @@ func hFishingLoad(ctx *Ctx) ([]byte, bool) {
 	if ctx.Sess.Srv.tunableF("fight_load_full_sync", 0) != 0 {
 		ctx.Sess.Push4_22Full()
 	}
+	// 一条负载上报折算一次判定：未锁轮超泄力算打滑磨摩擦片，锁轮超承力按发热曲线烧。
+	ctx.Sess.Srv.recordFightReelLoad(ctx)
 	return nil, true
 }
 
@@ -1414,6 +1614,7 @@ func registerSessionHandlers(d *Dispatch) {
 	d.Register(11, 2, hShortcutBind)
 	d.Register(11, 3, hShortcutUnbind)
 	d.Register(3, 9, hPositionReport) // 位置同步：记录玩家世界坐标
+	d.Register(3, 13, hKitchenEat)    // 3/13 player/kitchen_eat：野外厨房进食，恢复饱食度
 	d.Register(3, 30, hRigSyncBackpack)
 	d.Register(3, 31, hRigSyncRig)
 	d.Register(3, 37, hPlaceBuyout)

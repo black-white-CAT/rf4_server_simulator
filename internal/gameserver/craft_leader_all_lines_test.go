@@ -82,7 +82,7 @@ func craftLeaderOnce(t *testing.T, srv *Server, db *store.DB, uid int64, lineIte
 	return nil
 }
 
-// assertCraftedLeaderUsable 校验成品引线：内嵌线材必须是真实前导线定义，
+// assertCraftedLeaderUsable 校验成品引线：线材必须落在与材料相同的协议槽位，
 // 强度按玩家那一根线计算，并且物品还能重新物化下发。
 func assertCraftedLeaderUsable(
 	t *testing.T, srv *Server, db *store.DB, crafted *store.Item, wantLineKg float64,
@@ -94,11 +94,20 @@ func assertCraftedLeaderUsable(
 	if err != nil {
 		t.Fatalf("成品 fields_json 不可解析: %v", err)
 	}
-	wireClass := categoryWireClass[gearCatLeaderWire]
-	lineObj := fields[fieldIdxByCS(crafted.WireClass, gearAttrLeaderIn)].Val
+	lineKey := craftedMainLineKey
+	lineObj := fields[fieldIdxByCS(crafted.WireClass, lineKey)].Val
+	if lineObj == nil || lineObj.Kind == proto.KindNull {
+		lineKey = gearAttrLeaderIn
+		lineObj = fields[fieldIdxByCS(crafted.WireClass, lineKey)].Val
+	}
 	if lineObj == nil || lineObj.Kind != proto.KindObj {
 		t.Fatalf("成品缺少内嵌线材: %+v", lineObj)
 	}
+	lineCategory := gearCatLine
+	if lineKey == gearAttrLeaderIn {
+		lineCategory = gearCatLeaderWire
+	}
+	wireClass := categoryWireClass[lineCategory]
 	if lineObj.Class != wireClass.Class || lineObj.TypeID != uint32(wireClass.TypeID) {
 		t.Fatalf("内线协议类型=%s/%d，期望 %s/%d",
 			lineObj.Class, lineObj.TypeID, wireClass.Class, wireClass.TypeID)
@@ -108,9 +117,9 @@ func assertCraftedLeaderUsable(
 	if err != nil || wireDef == nil {
 		t.Fatalf("内线定义不存在: %d", numericID)
 	}
-	if wireDef.Category != gearCatLeaderWire {
-		t.Fatalf("内线模型 %s 品类=%d，期望前导线 %d",
-			wireDef.ItemID, wireDef.Category, gearCatLeaderWire)
+	if wireDef.Category != lineCategory {
+		t.Fatalf("内线模型 %s 品类=%d，期望材料品类 %d",
+			wireDef.ItemID, wireDef.Category, lineCategory)
 	}
 	if got := u64Of(lineObj.Fields[fieldIdxByCS(lineObj.Class, gearAttrLineLen)].Num); got != leaderSweepLengthCM {
 		t.Fatalf("内线长度=%d，期望 %dcm", got, leaderSweepLengthCM)
@@ -129,7 +138,7 @@ func assertCraftedLeaderUsable(
 	if err != nil {
 		t.Fatalf("成品引线无法下发: %v", err)
 	}
-	reloaded := tree.Fields[fieldIdxByCS(tree.Class, gearAttrLeaderIn)].Val
+	reloaded := tree.Fields[fieldIdxByCS(tree.Class, lineKey)].Val
 	if reloaded == nil || reloaded.Kind != proto.KindObj ||
 		u64Of(reloaded.Fields[fieldIdxByCS(reloaded.Class, csNumericID)].Num) != uint64(numericID) {
 		t.Fatalf("重新下发后内线模型发生变化: %+v", reloaded)
@@ -139,7 +148,8 @@ func assertCraftedLeaderUsable(
 // TestRepresentativeLinesCanCraftCraftedLeader 抽样走真实 9/1 制作：
 // 覆盖不同线种、材质和拉力区间，验证成品模型、强度、入包和重新下发。
 func TestRepresentativeLinesCanCraftCraftedLeader(t *testing.T) {
-	db := openRecipeTestDB(t)
+	t.Parallel()
+	db := openStaticTestDB(t)
 	ctx := context.Background()
 	srv := newSkillsCraftServer(t, db)
 	const uid = int64(2000043)
@@ -162,7 +172,7 @@ func TestRepresentativeLinesCanCraftCraftedLeader(t *testing.T) {
 		}
 	}
 
-	for _, itemID := range representativeLeaderCraftItems {
+	for _, itemID := range sampleForShort(t, representativeLeaderCraftItems, 4) {
 		def := defs[itemID]
 		if def == nil {
 			t.Fatalf("抽样线材 %s 不在目录中", itemID)
@@ -188,7 +198,8 @@ func TestRepresentativeLinesCanCraftCraftedLeader(t *testing.T) {
 // TestLeaderWireMappingCoversEveryLine 是 -short 也跑的快速版本：
 // 只验证目录里每一根线都能选到一根像样的前导线定义。
 func TestLeaderWireMappingCoversEveryLine(t *testing.T) {
-	db := openRecipeTestDB(t)
+	t.Parallel()
+	db := openStaticTestDB(t)
 	ctx := context.Background()
 	srv := newSkillsCraftServer(t, db)
 
@@ -203,6 +214,8 @@ func TestLeaderWireMappingCoversEveryLine(t *testing.T) {
 	if len(lineDefs) == 0 || len(wireDefs) == 0 {
 		t.Fatal("测试库缺少线材或前导线目录")
 	}
+	lineDefs = sampleForShort(t, lineDefs, 12)
+	wireDefs = sampleForShort(t, wireDefs, 12)
 	for _, def := range append(append([]*store.ItemDef{}, lineDefs...), wireDefs...) {
 		wireDef, err := srv.leaderWireDefForLine(ctx, def)
 		if err != nil {
@@ -225,7 +238,8 @@ func TestLeaderWireMappingCoversEveryLine(t *testing.T) {
 // 用目录里没有孪生前导线的 60kg 编织线做一根引线，装到海钓钓组的前导槽，
 // 钓组必须把它当成真前导。
 func TestCraftedLeaderFromUnmappedLineEquipsIntoRig(t *testing.T) {
-	db := openRecipeTestDB(t)
+	t.Parallel()
+	db := openStaticTestDB(t)
 	ctx := context.Background()
 	srv := newSkillsCraftServer(t, db)
 	const uid = int64(2000044)

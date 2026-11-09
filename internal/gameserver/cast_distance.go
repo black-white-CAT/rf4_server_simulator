@@ -351,13 +351,10 @@ func castReelTypeFactor(reelType int64) float64 {
 	}
 }
 
+// castPlayerStateFactor 玩家状态修正器：精力/饱食度越低抛得越近。
+// 0 值是真实空状态，按 0 参与加权、落到 0.70 下限；
+// 不再把 <=0 重置为默认值（旧边界会把真·空状态当成满状态）。
 func castPlayerStateFactor(primary, secondary float64) float64 {
-	if primary <= 0 {
-		primary = defaultPlayerConditionPrimary
-	}
-	if secondary <= 0 {
-		secondary = defaultPlayerConditionSecondary
-	}
 	state := 0.55*(primary/defaultPlayerConditionPrimary) +
 		0.45*(secondary/defaultPlayerConditionSecondary)
 	return clampFloat(state, 0.70, 1.03)
@@ -558,7 +555,9 @@ func (s *Server) castDistanceForRig(ctx context.Context, uid int64, rodGUID stri
 	p.PlayerPrimary, p.PlayerSecondary = s.castPlayerCondition(ctx, uid)
 	p.ReelType, p.SpoolSize, p.SpoolCapacityM = s.castReelSpoolStats(ctx, reel, ids.Line)
 	if p.SpoolCapacityM > 0 && p.LineLengthM > 0 {
-		p.SpoolFill = p.LineLengthM / p.SpoolCapacityM
+		// 线长是整盘标称长度；超过杯容量时按容量计，避免 600m 线盘被当成
+		// 25 倍超装。
+		p.SpoolFill = spoolFillRatio(p.LineLengthM, p.SpoolCapacityM)
 	}
 
 	c := CastDistanceContext{
@@ -588,7 +587,11 @@ func (s *Server) castDistanceForRig(ctx context.Context, uid int64, rodGUID stri
 	p.SpecialSkillFactor = p.Factors["special_skill"]
 
 	if p.LineLengthM > 0 {
+		// 线杯只能容纳 SpoolCapacityM；整盘线长可能只是商品标称长度。
 		p.LineLimitM = p.LineLengthM
+		if p.SpoolCapacityM > 0 && p.SpoolCapacityM < p.LineLimitM {
+			p.LineLimitM = p.SpoolCapacityM
+		}
 		p.DistanceM = math.Min(p.DistanceM, p.LineLimitM)
 	}
 	if clip, ok := s.savedReelClipM(ctx, rodGUID); ok && clip > 0 {

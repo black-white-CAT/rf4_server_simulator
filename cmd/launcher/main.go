@@ -28,10 +28,12 @@ import (
 	"github.com/getlantern/systray"
 
 	"rf4server/internal/admin"
+	"rf4server/internal/buildinfo"
 	"rf4server/internal/config"
 	"rf4server/internal/seed"
 	"rf4server/internal/store"
 	"rf4server/internal/supervisor"
+	"rf4server/internal/updatecheck"
 )
 
 //go:embed panel.html
@@ -116,6 +118,7 @@ func main() {
 		cfg: cfg, cfgPath: *configPath, log: panelLogger{}, ctx: appCtx, cancel: appCancel,
 		avatarDir: "avatars",
 		trayColor: 3, trayTip: "fish-localserver 本地服务器", // 3=灰（初始化中）
+		updates: updatecheck.New(updatecheck.DefaultSources, updateStateFile),
 	}
 	defer app.closeAdmin()
 	//加入头像服务器监听
@@ -157,6 +160,7 @@ func main() {
 	mux.HandleFunc("/api/game/config", app.handleGameConfig)
 	mux.HandleFunc("/api/game/launch", app.handleGameLaunch)
 	mux.HandleFunc("/api/hosts", app.handleHosts)
+	mux.HandleFunc("POST /api/update/dismiss", app.handleUpdateDismiss)
 	mux.HandleFunc("/api/open-admin", func(w http.ResponseWriter, r *http.Request) {
 		openBrowser(app.panelURL + "#admin")
 		_ = r
@@ -170,6 +174,7 @@ func main() {
 	}
 	app.panelURL = "http://" + normalizeLocal(ln.Addr().String())
 	go func() { _ = http.Serve(ln, mux) }()
+	go app.runUpdateChecks()
 	// 启动即用默认浏览器打开统一控制中心
 	openBrowser(app.panelURL)
 
@@ -378,6 +383,9 @@ func (a *app) handleStatus(w http.ResponseWriter, _ *http.Request) {
 		"game_region":     gameRegion,
 		"avatar_base_url": avatarBaseURL,
 		"hosts":           hostsMode(hostsFilePath()),
+		"current_version": buildinfo.Version,
+		"update":          update,
+		"update_status":   a.updateHealthSnapshot(),
 	})
 }
 
@@ -491,6 +499,12 @@ func (a *app) initAdmin(ctx context.Context) error {
 		return err
 	}
 	srv := admin.NewServer(a.cfg.Admin, db, adminLogger{a.log}, admin.WebFS())
+	// 更新检测可能先于管理后台就绪已有结论，补推一次。
+	var update *updatecheck.Result
+	if a.updates != nil {
+		update = a.updates.Result()
+	}
+	srv.SetUpdateInfo(adminUpdateInfo(update))
 	a.adminMu.Lock()
 	a.adminDB = db
 	a.adminSrv = srv
