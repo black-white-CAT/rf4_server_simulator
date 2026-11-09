@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"log/slog"
 	"net"
+	"sort"
 	"sync"
 	"time"
 
@@ -56,6 +57,7 @@ type Server struct {
 	fishStates             map[int64]map[string]*FishState
 	heldFishingRods        map[int64]string
 	fishMu                 sync.Mutex
+	overloadProtectionMu   sync.RWMutex // 在线开关与断件/负载判定同步
 	levelMap               map[int64]string
 	levelMu                sync.Mutex
 	fishEcologyMu          sync.RWMutex
@@ -309,4 +311,21 @@ func (s *Server) SessionCount() int64 {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return int64(len(s.sessions))
+}
+
+// OnlineUIDs 在线玩家 UID（去重升序，同一玩家的重连会话只算一个；管理后台在线灯用）。
+func (s *Server) OnlineUIDs() []int64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]int64, 0, len(s.sessions))
+	seen := make(map[int64]bool, len(s.sessions))
+	for _, sess := range s.sessions {
+		if sess == nil || sess.Closed() || sess.Userid <= 0 || seen[sess.Userid] {
+			continue
+		}
+		seen[sess.Userid] = true
+		out = append(out, sess.Userid)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+	return out
 }
