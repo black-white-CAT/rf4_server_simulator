@@ -120,7 +120,7 @@ func main() {
 	defer app.closeAdmin()
 	//加入头像服务器监听
 	avatarMux := http.NewServeMux()
-	avatarMux.HandleFunc(avatarImagePath, app.handleAvatarImage)
+	avatarMux.HandleFunc(avatarPathPrefix, app.handleAvatarImage)
 	avatarLn, err := net.Listen("tcp", *avatarAddr)
 	if err != nil {
 		showFatal("头像服务监听失败", err)
@@ -366,27 +366,19 @@ func (a *app) handleStatus(w http.ResponseWriter, _ *http.Request) {
 	adminErr := a.adminErr
 	a.adminMu.RUnlock()
 	gamePath, gameRegion := a.gameState()
-	avatarURL := a.avatarStatusURL()
+	avatarBaseURL := a.suggestedAvatarBaseURL()
 
 	writeJSON(w, map[string]any{
-		"procs":       procs,
-		"last_error":  lastErr,
-		"admin":       "/admin/",
-		"admin_ready": adminReady,
-		"admin_error": adminErr,
-		"game_path":   gamePath,
-		"game_region": gameRegion,
-		"avatar_url":  avatarURL,
-		"hosts":       hostsMode(hostsFilePath()),
+		"procs":           procs,
+		"last_error":      lastErr,
+		"admin":           "/admin/",
+		"admin_ready":     adminReady,
+		"admin_error":     adminErr,
+		"game_path":       gamePath,
+		"game_region":     gameRegion,
+		"avatar_base_url": avatarBaseURL,
+		"hosts":           hostsMode(hostsFilePath()),
 	})
-}
-func (a *app) avatarStatusURL() string {
-	a.avatarMu.RLock()
-	defer a.avatarMu.RUnlock()
-	if a.cfg != nil && strings.TrimSpace(a.cfg.Game.AvatarURL) != "" {
-		return a.cfg.Game.AvatarURL
-	}
-	return a.suggestedAvatarURL()
 }
 
 // handleHosts 面板 hosts 指向开关：GET 返回当前指向，POST ?mode=local|official 切换。

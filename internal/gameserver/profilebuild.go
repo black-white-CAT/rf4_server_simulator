@@ -162,6 +162,13 @@ func (s *Server) BuildProfile307W(ctx context.Context, uid int64, wNow int64) (*
 		0: proto.Args(proto.S("210"), build5013()),
 	})
 
+	avatarURL, err := s.DB.PlayerAvatarURL(ctx, p.UID)
+	if err != nil {
+		return nil, err
+	}
+	if avatarURL == "" {
+		avatarURL = s.cfg.AvatarURL
+	}
 	// f23 钓鱼游（wire 类 hajlpdpmnfe/1506）：客户端世界地图按 dhaenhabecc
 	// 匹配地图键（hncnmlgnhjm.hlcjincbjma），据此渲染"✈还剩下N天"徽章、
 	// 免入场费划线价、等级锁绕过（反编译 Assembly-CSharp 证实）。
@@ -212,7 +219,7 @@ func (s *Server) BuildProfile307W(ctx context.Context, uid int64, wNow int64) (*
 		6:  proto.U32(uint32(totalPts)),
 		7:  proto.U64(uint64(p.Silver)),
 		8:  proto.U64(uint64(p.Gold)),
-		9:  proto.StrVal(s.currentAvatarURL()),
+		9:  proto.StrVal(avatarURL),
 		10: proto.U32(membershipKind),
 		11: proto.U64(membershipExp),
 		12: s.buildPose308(ctx, uid),

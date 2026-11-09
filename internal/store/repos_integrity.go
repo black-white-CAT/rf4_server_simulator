@@ -32,6 +32,7 @@ var RuntimeTables = []string{
 	"kv", "admin_queue", "achievement_def", "static_dataset_meta", "schema_migrations",
 	"request_receipts", "market_offer", "shop_item_override",
 	"fish_weight_override", "fish_bite_setting", "fish_grade_lines", "skill_link",
+	"player_avatar",
 	"fish_ecology", "skill_fish_effect_def",
 }
 

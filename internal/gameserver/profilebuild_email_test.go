@@ -8,13 +8,17 @@ import (
 func TestProfile307SuppressesEmailBindingPrompt(t *testing.T) {
 	db := connectTestDB(t)
 	srv := NewServerForGearTest(t, db)
-	srv.setAvatarURL("http://127.0.0.1:8090/avatars/avatar.png")
+
 	ctx := context.Background()
 	const uid = int64(1000001)
-	if _, err := db.EnsureProfile(ctx, uid); err != nil {
+	profile, err := db.EnsureProfile(ctx, uid)
+	if err != nil {
 		t.Fatal(err)
 	}
-	srv.execAdminCmd(&AdminCommand{Op: "update_avatar", Text: "http://127.0.0.1:8090/avatars/avatar.png?v=updated"})
+	const avatarURL = "http://127.0.0.1:8090/avatars/1000001.png"
+	if err := db.SetPlayerAvatar(ctx, uid, profile.Name, avatarURL); err != nil {
+		t.Fatal(err)
+	}
 	p, err := srv.BuildProfile307(ctx, uid)
 	if err != nil {
 		t.Fatal(err)
@@ -22,7 +26,7 @@ func TestProfile307SuppressesEmailBindingPrompt(t *testing.T) {
 	if flags := u32Of(p.Fields[15].Num); flags&0x100 == 0 {
 		t.Fatalf("307.f15 未跳过邮箱绑定提示: 0x%x", flags)
 	}
-	if p.Fields[9].Str == nil || *p.Fields[9].Str != "http://127.0.0.1:8090/avatars/avatar.png?v=updated" {
-		t.Fatalf("307.f9 avatar=%v, want %q", p.Fields[9].Str, srv.currentAvatarURL())
+	if p.Fields[9].Str == nil || *p.Fields[9].Str != avatarURL {
+		t.Fatalf("307.f9 avatar=%v, want %q", p.Fields[9].Str, avatarURL)
 	}
 }

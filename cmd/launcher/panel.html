@@ -624,28 +624,37 @@
           <div class="game-copy">
             <h2>上传玩家头像</h2>
             <p>
-              支持 PNG、JPEG、GIF，最大 5 MiB。确认客户端可访问上方
-              URL；上传后会自动刷新在线玩家档案。
+              输入唯一玩家用户名并选择图片。头像会绑定到该玩家；支持
+              PNG、JPEG、GIF，最大 5 MiB。
             </p>
           </div>
           <div class="avatar-editor">
             <input
-              id="avatarUrl"
+              id="avatarUsername"
+              type="text"
+              maxlength="128"
+              autocomplete="off"
+              placeholder="玩家用户名"
+              aria-label="玩家用户名"
+              oninput="markAvatarFile()"
+            />
+            <input
+              id="avatarBaseUrl"
               type="url"
               spellcheck="false"
-              aria-label="客户端可访问的头像地址"
+              aria-label="客户端可访问的图片服务地址"
             />
             <input
               id="avatarFile"
               type="file"
               accept="image/png,image/jpeg,image/gif"
-              onchange="markAvatarFile()"
+              onchange="previewAvatarFile()"
             />
           </div>
           <img
             id="avatarPreview"
             class="avatar-preview"
-            alt="当前玩家头像"
+            alt="玩家头像预览"
             onerror="this.hidden = true"
             hidden
           />
@@ -864,27 +873,29 @@
         updateGameButtons();
       }
       function renderAvatarConfig(st) {
-        const input = document.getElementById("avatarUrl");
-        if (document.activeElement !== input) input.value = st.avatar_url || "";
-        const preview = document.getElementById("avatarPreview");
-        const url = input.value.trim();
-        if (!url) {
-          preview.hidden = true;
-          preview.removeAttribute("src");
-          delete preview.dataset.url;
-        } else if (preview.dataset.url !== url) {
-          preview.dataset.url = url;
-          preview.src =
-            url + (url.includes("?") ? "&" : "?") + "_=" + Date.now();
-          preview.hidden = false;
-        }
+        const input = document.getElementById("avatarBaseUrl");
+        if (document.activeElement !== input)
+          input.value = st.avatar_base_url || "";
       }
 
       function markAvatarFile() {
         const file = document.getElementById("avatarFile").files[0];
-        document.getElementById("avatarUploadBtn").disabled = !file;
+        const username = document.getElementById("avatarUsername").value.trim();
+        document.getElementById("avatarUploadBtn").disabled =
+          !file || !username;
       }
-
+      function previewAvatarFile() {
+        const file = document.getElementById("avatarFile").files[0];
+        const preview = document.getElementById("avatarPreview");
+        if (file) {
+          if (preview.dataset.objectUrl)
+            URL.revokeObjectURL(preview.dataset.objectUrl);
+          preview.dataset.objectUrl = URL.createObjectURL(file);
+          preview.src = preview.dataset.objectUrl;
+          preview.hidden = false;
+        }
+        markAvatarFile();
+      }
       function setAvatarNotice(message, type = "") {
         const el = document.getElementById("avatarNotice");
         el.hidden = !message;
@@ -899,7 +910,14 @@
         if (!file) return;
         const form = new FormData();
         form.append("image", file);
-        form.append("url", document.getElementById("avatarUrl").value.trim());
+        form.append(
+          "username",
+          document.getElementById("avatarUsername").value.trim(),
+        );
+        form.append(
+          "base_url",
+          document.getElementById("avatarBaseUrl").value.trim(),
+        );
         button.disabled = true;
         button.textContent = "上传中…";
         try {
@@ -909,12 +927,16 @@
           });
           if (!r.ok) throw new Error(await readAPIError(r, "上传失败"));
           const data = await r.json();
-          document.getElementById("avatarUrl").value = data.url;
-          delete document.getElementById("avatarPreview").dataset.url;
-          renderAvatarConfig({ avatar_url: data.url });
+
+          const preview = document.getElementById("avatarPreview");
+          if (preview.dataset.objectUrl)
+            URL.revokeObjectURL(preview.dataset.objectUrl);
+          delete preview.dataset.objectUrl;
+          preview.src = data.url;
+          preview.hidden = false;
           fileInput.value = "";
           setAvatarNotice(
-            "头像已上传并提交在线档案刷新。确认客户端可以访问上方 URL；若玩家仍看到旧图，请重新登录。",
+            `已将头像绑定到「${data.username}」（UID ${data.uid}），在线玩家档案已提交刷新。`,
             "ok",
           );
         } catch (e) {
